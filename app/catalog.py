@@ -1,5 +1,5 @@
 """
-app/catalog.py — Agent Catalog UI v3
+app/catalog.py — Agent Catalog UI v4
 
 Three input modes per agent:
   A. Unity Catalog / Hive metastore  — type catalog.schema, pick tables
@@ -11,7 +11,7 @@ before running an agent. Relationship detection runs automatically.
 """
 
 from __future__ import annotations
-import json, sys
+import json, os, sys
 from pathlib import Path
 
 import streamlit as st
@@ -302,102 +302,189 @@ tab_catalog, tab_file, tab_json = st.tabs([
 # ── Tab A: Catalog ────────────────────────────────────────────────────────────
 with tab_catalog:
     st.caption(
-        "Connect to any Unity Catalog or Hive metastore schema. "
-        "The platform queries INFORMATION_SCHEMA and computes column stats automatically."
+        "Browse your Unity Catalog or Hive metastore directly. "
+        "Select a catalog → schema → tables. Column stats are fetched automatically "
+        "if a SQL warehouse ID is configured (optional)."
     )
-    c1, c2 = st.columns([2,1])
-    with c1:
-        cat_schema = st.text_input(
-            "Catalog and schema",
-            placeholder="e.g. crm_prod.raw  or  hive_metastore.default",
-            help="Format: catalog.schema (Unity Catalog) or just schema (Hive metastore)",
-        )
-    with c2:
-        specific_tables = st.text_input(
-            "Specific tables (optional)",
-            placeholder="customer, orders, products",
-            help="Comma-separated. Leave blank to load ALL tables in the schema.",
-        )
 
-    col_src, col_btn = st.columns([2,1])
-    with col_src:
+    # Step 1 — pick catalog
+    with st.spinner("Loading catalogs…"):
+        try:
+            available_catalogs = extractor.list_catalogs()
+        except Exception as e:
+            available_catalogs = []
+            st.warning(f"Could not list catalogs: {e}")
+
+    if not available_catalogs:
+        st.info(
+            "No catalogs found via the SDK. "
+            "Type the catalog and schema name manually below."
+        )
+        manual_cat_schema = st.text_input(
+            "Catalog.schema",
+            placeholder="samples.tpch  or  hive_metastore.default",
+        )
+        available_catalogs = []
+        sel_catalog = manual_cat_schema.split(".")[0] if "." in manual_cat_schema else ""
+        sel_schema  = manual_cat_schema.split(".")[1] if "." in manual_cat_schema else ""
+        available_schemas = [sel_schema] if sel_schema else []
+        available_tables  = []
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_catalog = st.selectbox("Catalog", available_catalogs)
+        with c2:
+            if sel_catalog:
+                with st.spinner(f"Loading schemas in {sel_catalog}…"):
+                    available_schemas = extractor.list_schemas(sel_catalog)
+            else:
+                available_schemas = []
+            sel_schema = st.selectbox(
+                "Schema",
+                available_schemas if available_schemas else ["— select a catalog first —"],
+                disabled=not available_schemas,
+            )
+
+        # Step 2 — pick tables
+        if sel_catalog and sel_schema and sel_schema != "— select a catalog first —":
+            with st.spinner(f"Loading tables in {sel_catalog}.{sel_schema}…"):
+                available_tables = extractor.list_tables(sel_catalog, sel_schema)
+        else:
+            available_tables = []
+
+    if available_tables:
+        sel_tables = st.multiselect(
+            f"Tables in {sel_catalog}.{sel_schema}  ({len(available_tables)} available)",
+            options=available_tables,
+            default=[],
+            help="Select one or more tables. Leave blank to load ALL tables in the schema.",
+        )
+    else:
+        sel_tables = []
+
+    # Optional settings
+    with st.expander("⚙️ Advanced options"):
         rec_src_prefix = st.text_input(
             "Record source prefix (optional)",
             placeholder="e.g. salesforce or sap.erp",
             help="Prepended to table name for the DV2 RECORD_SOURCE column.",
         )
-    with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)
-        load_catalog_btn = st.button("Load from catalog", use_container_width=True)
+        wh_id_input = st.text_input(
+            "SQL Warehouse ID (optional — for column stats)",
+            value=os.getenv("DATABRICKS_WAREHOUSE_ID", ""),
+            help=(
+                "If provided, the platform runs COUNT, COUNT(DISTINCT) and sample "
+                "queries to enrich the schema with null_pct, distinct_count, and "
+                "sample_values. Find the ID in SQL Warehouses → your warehouse → Connection details."
+            ),
+        )
+
+    load_catalog_btn = st.button(
+        "Load selected tables" if sel_tables else "Load ALL tables in schema",
+        use_container_width=True,
+        disabled=(not sel_catalog or not sel_schema or sel_schema == "— select a catalog first —"),
+    )
 
     if load_catalog_btn:
-        if not cat_schema.strip():
-            st.error("Please enter a catalog.schema value.")
+        names = sel_tables if sel_tables else None
+        # Re-init extractor with warehouse ID if provided
+        if wh_id_input.strip():
+            from core.metadata_extractor import MetadataExtractor as _ME
+            _ex = _ME(warehouse_id=wh_id_input.strip())
         else:
-            names = [t.strip() for t in specific_tables.split(",") if t.strip()] or None
-            with st.spinner(f"Extracting schema from {cat_schema}…"):
-                try:
-                    tables = extractor.from_catalog(cat_schema.strip(), names, rec_src_prefix.strip())
-                    tables = extractor.detect_relationships(tables)
-                    for t in tables:
-                        # Avoid duplicates
-                        existing = [x["table_name"] for x in st.session_state.loaded_tables]
-                        if t["table_name"] not in existing:
-                            st.session_state.loaded_tables.append(t)
-                    st.success(extractor.summary(tables))
-                except RuntimeError as e:
-                    st.error(str(e))
+            _ex = extractor
+
+        label = ", ".join(names) if names else f"all tables in {sel_catalog}.{sel_schema}"
+        with st.spinner(f"Extracting {label}…"):
+            try:
+                tables = _ex.from_catalog(
+                    sel_catalog, sel_schema, names, rec_src_prefix.strip()
+                )
+                all_loaded = st.session_state.loaded_tables + tables
+                all_loaded = _ex.detect_relationships(all_loaded)
+                for t in tables:
+                    existing = [x["table_name"] for x in st.session_state.loaded_tables]
+                    if t["table_name"] not in existing:
+                        st.session_state.loaded_tables.append(t)
+                st.success(_ex.summary(tables))
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
 # ── Tab B: File path ──────────────────────────────────────────────────────────
 with tab_file:
-    st.caption(
-        "Point at a cloud storage path. The platform reads a sample using Spark, "
-        "infers the schema, and computes column statistics."
-    )
-    f1, f2, f3 = st.columns([3,1,1])
-    with f1:
-        file_path = st.text_input(
-            "Cloud file path",
-            placeholder="s3://my-bucket/data/customer/  or  abfss://raw@acct.dfs.core.windows.net/crm/",
+    if not _spark_available():
+        st.warning(
+            "**File path extraction is not available inside a Databricks App.**\n\n"
+            "Databricks Apps run as lightweight web containers without a Spark session. "
+            "To use data from a cloud file path:\n\n"
+            "1. Open a Databricks **notebook** attached to a cluster\n"
+            "2. Run this code to extract the metadata:\n"
         )
-    with f2:
-        file_fmt = st.selectbox("Format", ["parquet","delta","csv","json","avro"])
-    with f3:
-        tbl_name_override = st.text_input("Table name override", placeholder="customer")
+        st.code(
+            """import sys
+sys.path.insert(0, "/Workspace/Users/<your-path>/agent_platform")
+from core.metadata_extractor import MetadataExtractor
+import json
 
-    fc1, fc2 = st.columns([2,1])
-    with fc1:
-        sample_size = st.number_input(
-            "Sample rows for stats",
-            min_value=100, max_value=100000, value=10000, step=1000,
-            help="Reads this many rows to compute null rates and distinct counts. Higher = more accurate but slower.",
+ex = MetadataExtractor()
+tables = ex.from_file(
+    path="s3://your-bucket/your-path/",
+    file_format="parquet",   # parquet | delta | csv | json | avro
+    sample_rows=10000,
+    table_name="my_table",   # optional override
+)
+tables = ex.detect_relationships(tables)
+
+# Copy this output and paste into the 'Paste JSON manually' tab in the App:
+print(json.dumps(tables, indent=2))""",
+            language="python",
         )
-    with fc2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        load_file_btn = st.button("Load from file", use_container_width=True)
+        st.info(
+            "Copy the JSON output from the notebook and paste it into the "
+            "**✏️ Paste JSON manually** tab above."
+        )
+    else:
+        st.caption("Extract schema and column stats from a cloud file path using Spark.")
+        f1, f2, f3 = st.columns([3,1,1])
+        with f1:
+            file_path = st.text_input("Cloud file path",
+                placeholder="s3://my-bucket/data/customer/  or  abfss://raw@acct.dfs.core.windows.net/crm/")
+        with f2:
+            file_fmt = st.selectbox("Format", ["parquet","delta","csv","json","avro"])
+        with f3:
+            tbl_name_override = st.text_input("Table name", placeholder="customer")
 
-    if load_file_btn:
-        if not file_path.strip():
-            st.error("Please enter a file path.")
-        else:
-            with st.spinner(f"Reading {file_fmt} from {file_path}…"):
-                try:
-                    tables = extractor.from_file(
-                        path=file_path.strip(),
-                        file_format=file_fmt,
-                        sample_rows=int(sample_size),
-                        table_name=tbl_name_override.strip() or None,
-                    )
-                    tables = extractor.detect_relationships(
-                        st.session_state.loaded_tables + tables
-                    )
-                    for t in tables:
-                        existing = [x["table_name"] for x in st.session_state.loaded_tables]
-                        if t["table_name"] not in existing:
-                            st.session_state.loaded_tables.append(t)
-                    st.success(extractor.summary(tables[-1:]))
-                except (RuntimeError, ValueError) as e:
-                    st.error(str(e))
+        fc1, fc2 = st.columns([2,1])
+        with fc1:
+            sample_size = st.number_input("Sample rows", min_value=100, max_value=100000,
+                                          value=10000, step=1000)
+        with fc2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            load_file_btn = st.button("Load from file", use_container_width=True)
+
+        if load_file_btn:
+            if not file_path.strip():
+                st.error("Please enter a file path.")
+            else:
+                with st.spinner(f"Reading {file_fmt} from {file_path}…"):
+                    try:
+                        tables = extractor.from_file(
+                            path=file_path.strip(), file_format=file_fmt,
+                            sample_rows=int(sample_size),
+                            table_name=tbl_name_override.strip() or None,
+                        )
+                        for t in tables:
+                            existing = [x["table_name"] for x in st.session_state.loaded_tables]
+                            if t["table_name"] not in existing:
+                                st.session_state.loaded_tables.append(t)
+                        st.session_state.loaded_tables = extractor.detect_relationships(
+                            st.session_state.loaded_tables
+                        )
+                        st.success(extractor.summary(tables))
+                        st.rerun()
+                    except (RuntimeError, ValueError) as e:
+                        st.error(str(e))
 
 # ── Tab C: Manual JSON ────────────────────────────────────────────────────────
 with tab_json:
