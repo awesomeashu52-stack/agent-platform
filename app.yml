@@ -1,0 +1,5 @@
+# app.yml — Databricks Apps configuration
+# Must be at the ROOT of the Git repository.
+# Databricks Apps reads this file to know how to start the application.
+
+command: ["streamlit", "run", "app/catalog.py", "--server.port", "$DATABRICKS_APP_PORT", "--server.address", "0.0.0.0", "--server.headless", "true", "--server.enableCORS", "false", "--server.enableXsrfProtection", "false"]
