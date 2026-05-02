@@ -1,0 +1,45 @@
+{
+  "status": "success",
+  "output": {
+    "samples": [
+      {
+        "table_name": "customer",
+        "row_count": 5,
+        "rows": [
+          {
+            "customer_id": "WEWEEK",
+            "email": "YFRYAC",
+            "country_code": "BJPTIE",
+            "created_at": "2024-01-15T10:30:00Z"
+          },
+          {
+            "customer_id": "ECXUFU",
+            "email": "IDRTEL",
+            "country_code": "GMFILD",
+            "created_at": "2024-01-15T10:30:00Z"
+          },
+          {
+            "customer_id": "ZKZPVW",
+            "email": "KSUIZG",
+            "country_code": "RTYPDZ",
+            "created_at": "2024-01-15T10:30:00Z"
+          },
+          {
+            "customer_id": "LMTBOP",
+            "email": "OXLEIX",
+            "country_code": "ERHWIY",
+            "created_at": "2024-01-15T10:30:00Z"
+          },
+          {
+            "customer_id": "LUENOY",
+            "email": "VWJWJH",
+            "country_code": "DYGVRA",
+            "created_at": "2024-01-15T10:30:00Z"
+          }
+        ]
+      }
+    ]
+  },
+  "agent_id": "sample_gen",
+  "timestamp": "2026-05-02T10:12:51.357553+00:00"
+}

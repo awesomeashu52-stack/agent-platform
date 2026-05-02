@@ -1,0 +1,13 @@
+{
+  "agent_id": "lineage_creator",
+  "run_id": "lineage_creator_20260502101750",
+  "output": "```json\n{\n  \"lineage_graph\": {\n    \"nodes\": [\n      {\n        \"id\": \"crm_customer\",\n        \"label\": \"customer\",\n        \"type\": \"source\",\n        \"layer\": \"source\",\n        \"description\": \"CRM customer data\"\n      },\n      {\n        \"id\": \"bronze_customer\",\n        \"label\": \"customer\",\n        \"type\": \"bronze\",\n        \"layer\": \"bronze\",\n        \"description\": \"Raw customer data\"\n      },\n      {\n        \"id\": \"hub_customer\",\n        \"label\": \"HUB_CUSTOMER\",\n        \"type\": \"silver\",\n        \"layer\": \"silver\",\n        \"description\": \"Customer hub\"\n      },\n      {\n        \"id\": \"sat_customer\",\n        \"label\": \"SAT_CUSTOMER\",\n        \"type\": \"silver\",\n        \"layer\": \"silver\",\n        \"description\": \"Customer satellite\"\n      }\n    ],\n    \"edges\": [\n      {\n        \"from\": \"crm_customer\",\n        \"to\": \"bronze_customer\",\n        \"transformation\": \"raw data ingestion\",\n        \"load_type\": \"full\"\n      },\n      {\n        \"from\": \"bronze_customer\",\n        \"to\": \"hub_customer\",\n        \"transformation\": \"hash key generation\",\n        \"load_type\": \"full\"\n      },\n      {\n        \"from\": \"bronze_customer\",\n        \"to\": \"sat_customer\",\n        \"transformation\": \"SCD type 2 merge\",\n        \"load_type\": \"incremental\"\n      }\n    ]\n  },\n  \"summary\": \"Customer data flows from CRM system to bronze layer, then to silver layer as a hub and satellite.\"\n}\n```",
+  "token_usage": {
+    "prompt": 1820,
+    "completion": 348,
+    "total": 2168
+  },
+  "cost_usd": 0.01432,
+  "duration_s": 9.418,
+  "timestamp": "2026-05-02T10:17:59.715993+00:00"
+}

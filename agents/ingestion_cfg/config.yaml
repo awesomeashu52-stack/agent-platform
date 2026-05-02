@@ -1,0 +1,4 @@
+agent_settings:
+  execution_type: "non_agentic"
+  default_task: "Generate an Autoloader ingestion configuration for the provided schema."
+  description: "Template-driven Databricks Autoloader config generator. No LLM calls."

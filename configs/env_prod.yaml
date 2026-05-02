@@ -1,0 +1,25 @@
+# =============================================================================
+# Environment Override — Production
+# agent_platform/configs/env_prod.yaml
+#
+# Values here are MERGED OVER platform.yaml at runtime for production.
+# Activate with: export AGENT_PLATFORM_ENV=prod
+# =============================================================================
+
+platform:
+  environment: "prod"
+
+llm:
+  max_tokens: 4096          # Full token ceiling in prod
+  temperature: 0.1          # Slightly lower than dev for more deterministic outputs
+
+token_optimization:
+  cache_ttl_hours: 24       # Full 24h cache in prod
+
+unity_catalog:
+  catalog: "agent_platform" # Production catalog (separate from agent_platform_dev)
+
+logging:
+  level: "INFO"
+  log_to_uc: true           # Log all runs to UC Delta in prod
+  log_table: "agent_platform.metadata.run_logs"

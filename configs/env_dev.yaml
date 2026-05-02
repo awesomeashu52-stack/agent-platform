@@ -1,0 +1,24 @@
+# =============================================================================
+# Environment Override — Development
+# agent_platform/configs/env_dev.yaml
+#
+# Values here are MERGED OVER platform.yaml at runtime for the dev environment.
+# Copy to env_staging.yaml / env_prod.yaml and adjust as needed.
+# =============================================================================
+
+platform:
+  environment: "dev"
+
+llm:
+  max_tokens: 2048          # Lower ceiling in dev to save cost
+  temperature: 0.3
+
+token_optimization:
+  cache_ttl_hours: 1        # Short cache in dev so changes propagate quickly
+
+unity_catalog:
+  catalog: "agent_platform_dev"   # Separate dev catalog
+
+logging:
+  level: "DEBUG"
+  log_to_uc: false          # Don't pollute UC logs during local dev

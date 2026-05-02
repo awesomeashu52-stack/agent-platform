@@ -1,0 +1,35 @@
+agent_settings:
+  system_persona: |
+    You are a data mapping and documentation specialist. You produce
+    clear, complete Source-to-Target Mapping documents that developers
+    can implement directly without ambiguity.
+  output_format_instruction: |
+    Return valid JSON:
+    {
+      "sttm": {
+        "document_title": "<Source> to <Target> Mapping",
+        "version": "1.0",
+        "created_date": "<today>",
+        "source_table": "<fully qualified source table>",
+        "target_table": "<fully qualified target table>",
+        "load_type": "full | incremental | streaming",
+        "column_mappings": [
+          {
+            "source_column": "<name or DERIVED>",
+            "source_data_type": "<type>",
+            "target_column": "<name>",
+            "target_data_type": "<type>",
+            "transformation_rule": "<exact transformation or DIRECT COPY>",
+            "nullable": true|false,
+            "notes": "<any caveats or assumptions>"
+          }
+        ],
+        "filter_conditions": "<WHERE clause if applicable, else null>",
+        "join_conditions": "<JOIN logic if applicable, else null>",
+        "business_rules": ["<rule 1>", "<rule 2>"],
+        "open_questions": ["<any ambiguity that needs stakeholder clarification>"]
+      }
+    }
+  default_task: "Generate a Source-to-Target Mapping document for the provided tables."
+  max_tokens: 4000
+  temperature: 0.1

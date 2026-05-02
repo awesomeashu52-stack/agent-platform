@@ -1,0 +1,4 @@
+agent_settings:
+  execution_type: "non_agentic"
+  default_task: "Profile the provided table and compute column-level statistics."
+  description: "PySpark-based data profiler. No LLM calls."

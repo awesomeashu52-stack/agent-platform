@@ -1,0 +1,13 @@
+{
+  "agent_id": "test_query_gen",
+  "run_id": "test_query_gen_20260502101700",
+  "output": "```json\n{\n  \"query_suite\": \"customer SQL Validation Queries\",\n  \"queries\": [\n    {\n      \"query_id\": \"Q_001\",\n      \"test_description\": \"NOT_NULL check on customer_id\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.silver.customer WHERE customer_id IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"No NULL values in customer_id\"\n    },\n    {\n      \"query_id\": \"Q_002\",\n      \"test_description\": \"UNIQUE check on customer_id\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) - COUNT(DISTINCT customer_id) FROM crm.silver.customer\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"All customer_id values are unique\"\n    },\n    {\n      \"query_id\": \"Q_003\",\n      \"test_description\": \"NOT_NULL check on country_code\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.silver.customer WHERE country_code IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"No NULL values in country_code\"\n    },\n    {\n      \"query_id\": \"Q_004\",\n      \"test_description\": \"NOT_NULL check on created_at\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.silver.customer WHERE created_at IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"No NULL values in created_at\"\n    },\n    {\n      \"query_id\": \"Q_005\",\n      \"test_description\": \"ROW_COUNT check\",\n      \"priority\": \"P2\",\n      \"sql\": \"SELECT CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END FROM crm.silver.customer\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"Table has at least one row\"\n    },\n    {\n      \"query_id\": \"Q_006\",\n      \"test_description\": \"FRESHNESS check on created_at\",\n      \"priority\": \"P2\",\n      \"sql\": \"SELECT CASE WHEN MAX(created_at) < CURRENT_TIMESTAMP - INTERVAL 25 HOURS THEN 1 ELSE 0 END FROM crm.silver.customer\",\n      \"pass_condition\": \"Returns 0\",\n      \"expected_zero_means\": \"Data is fresh (created_at within 25 hours)\"\n    }\n  ]\n}\n```",
+  "token_usage": {
+    "prompt": 2033,
+    "completion": 526,
+    "total": 2559
+  },
+  "cost_usd": 0.018055,
+  "duration_s": 13.292,
+  "timestamp": "2026-05-02T10:17:13.813252+00:00"
+}

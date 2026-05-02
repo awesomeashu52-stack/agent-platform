@@ -1,0 +1,4 @@
+agent_settings:
+  execution_type: "non_agentic"
+  default_task: "Generate synthetic sample data from schema."
+  description: "Schema-driven synthetic data generator. No LLM calls."

@@ -1,0 +1,13 @@
+{
+  "agent_id": "dq_query_gen",
+  "run_id": "dq_query_gen_20260502101736",
+  "output": "```json\n{\n  \"dq_query_suite\": \"customer DQ Queries\",\n  \"queries\": [\n    {\n      \"rule_id\": \"DQ_001\",\n      \"rule_type\": \"NOT_NULL\",\n      \"column\": \"customer_id\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.customer WHERE customer_id IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"monitoring_label\": \"NOT_NULL_customer_id\"\n    },\n    {\n      \"rule_id\": \"DQ_002\",\n      \"rule_type\": \"NOT_NULL\",\n      \"column\": \"country_code\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.customer WHERE country_code IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"monitoring_label\": \"NOT_NULL_country_code\"\n    },\n    {\n      \"rule_id\": \"DQ_003\",\n      \"rule_type\": \"NOT_NULL\",\n      \"column\": \"created_at\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) FROM crm.customer WHERE created_at IS NULL\",\n      \"pass_condition\": \"Returns 0\",\n      \"monitoring_label\": \"NOT_NULL_created_at\"\n    },\n    {\n      \"rule_id\": \"DQ_004\",\n      \"rule_type\": \"UNIQUE\",\n      \"column\": \"customer_id\",\n      \"priority\": \"P1\",\n      \"sql\": \"SELECT COUNT(*) - COUNT(DISTINCT customer_id) FROM crm.customer\",\n      \"pass_condition\": \"Returns 0\",\n      \"monitoring_label\": \"UNIQUE_customer_id\"\n    },\n    {\n      \"rule_id\": \"DQ_005\",\n      \"rule_type\": \"COMPLETENESS\",\n      \"column\": \"email\",\n      \"priority\": \"P3\",\n      \"sql\": \"SELECT SUM(CASE WHEN email IS NULL THEN 1 ELSE 0 END) FROM crm.customer\",\n      \"pass_condition\": \"Returns 0\",\n      \"monitoring_label\": \"COMPLETENESS_email\"\n    }\n  ]\n}\n```",
+  "token_usage": {
+    "prompt": 1812,
+    "completion": 441,
+    "total": 2253
+  },
+  "cost_usd": 0.015675,
+  "duration_s": 11.463,
+  "timestamp": "2026-05-02T10:17:47.761532+00:00"
+}

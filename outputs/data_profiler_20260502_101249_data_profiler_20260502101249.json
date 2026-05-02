@@ -1,0 +1,55 @@
+{
+  "status": "success",
+  "output": {
+    "profiles": [
+      {
+        "table_name": "customer",
+        "row_count": 500000,
+        "column_count": 4,
+        "columns": [
+          {
+            "name": "customer_id",
+            "data_type": "string",
+            "nullable": false,
+            "null_pct": 0.0,
+            "distinct_count": 500000,
+            "sample_values": [
+              "C001",
+              "C002"
+            ]
+          },
+          {
+            "name": "email",
+            "data_type": "string",
+            "nullable": true,
+            "null_pct": 0.03,
+            "distinct_count": 490000,
+            "sample_values": []
+          },
+          {
+            "name": "country_code",
+            "data_type": "string",
+            "nullable": false,
+            "null_pct": 0.0,
+            "distinct_count": 60,
+            "sample_values": [
+              "GB",
+              "US",
+              "IN"
+            ]
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp",
+            "nullable": false,
+            "null_pct": 0.0,
+            "distinct_count": 500000,
+            "sample_values": []
+          }
+        ]
+      }
+    ]
+  },
+  "agent_id": "data_profiler",
+  "timestamp": "2026-05-02T10:12:49.508380+00:00"
+}

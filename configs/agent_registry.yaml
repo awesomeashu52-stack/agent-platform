@@ -1,0 +1,118 @@
+# =============================================================================
+# Agent Registry
+# agent_platform/configs/agent_registry.yaml
+#
+# All 10 agents. The Streamlit UI reads this file dynamically.
+# To add a new agent: add an entry here + create agents/<id>/ folder.
+# To hide an agent: set enabled: false. No code changes needed.
+# =============================================================================
+
+agents:
+
+  # ---------------------------------------------------------------------------
+  # Agentic agents (LLM-driven)
+  # ---------------------------------------------------------------------------
+
+  - id: data_model_gen
+    display_name: "Data Model Generator"
+    description: "Generate Data Vault 2.0 or dimensional models from table metadata"
+    category: "Modelling"
+    type: "agentic"
+    icon: "🏗️"
+    enabled: true
+    config_path: "agents/data_model_gen/config.yaml"
+    tags: ["data-vault", "dimensional", "silver", "gold"]
+
+  - id: test_case_gen
+    display_name: "Test Case Generator"
+    description: "Generate functional and data validation test cases from schema metadata"
+    category: "Testing"
+    type: "agentic"
+    icon: "🧪"
+    enabled: true
+    config_path: "agents/test_case_gen/config.yaml"
+    tags: ["testing", "validation", "quality"]
+
+  - id: test_query_gen
+    display_name: "Test Query Generator"
+    description: "Generate SQL validation queries aligned with test scenarios"
+    category: "Testing"
+    type: "agentic"
+    icon: "🔍"
+    enabled: true
+    config_path: "agents/test_query_gen/config.yaml"
+    tags: ["sql", "testing", "validation"]
+
+  - id: dq_recommender
+    display_name: "DQ Rule Recommender"
+    description: "Suggest column-level and table-level data quality rules"
+    category: "Data Quality"
+    type: "agentic"
+    icon: "✅"
+    enabled: true
+    config_path: "agents/dq_recommender/config.yaml"
+    tags: ["data-quality", "rules", "governance"]
+
+  - id: dq_query_gen
+    display_name: "DQ Query Generator"
+    description: "Generate executable SQL for data quality checks from DQ rules"
+    category: "Data Quality"
+    type: "agentic"
+    icon: "📋"
+    enabled: true
+    config_path: "agents/dq_query_gen/config.yaml"
+    tags: ["sql", "data-quality"]
+
+  - id: lineage_creator
+    display_name: "Data Lineage Creator"
+    description: "Generate upstream/downstream lineage in visualization-ready JSON format"
+    category: "Governance"
+    type: "agentic"
+    icon: "🔗"
+    enabled: true
+    config_path: "agents/lineage_creator/config.yaml"
+    tags: ["lineage", "governance", "dependency"]
+
+  - id: sttm_gen
+    display_name: "STTM Generator"
+    description: "Create Source-to-Target Mapping documents with column-level SQL transforms"
+    category: "Documentation"
+    type: "agentic"
+    icon: "📄"
+    enabled: true
+    config_path: "agents/sttm_gen/config.yaml"
+    tags: ["sttm", "mapping", "documentation"]
+
+  # ---------------------------------------------------------------------------
+  # Non-agentic agents (deterministic — zero LLM cost)
+  # ---------------------------------------------------------------------------
+
+  - id: data_profiler
+    display_name: "Data Profiler"
+    description: "Generate column-level dataset statistics using PySpark — no LLM cost"
+    category: "Profiling"
+    type: "non_agentic"
+    icon: "📊"
+    enabled: true
+    config_path: "agents/data_profiler/config.yaml"
+    tags: ["profiling", "statistics", "pyspark"]
+
+  - id: sample_gen
+    display_name: "Sample Data Generator"
+    description: "Create synthetic, privacy-safe sample datasets from schema — no LLM cost"
+    category: "Profiling"
+    type: "non_agentic"
+    icon: "🎲"
+    enabled: true
+    config_path: "agents/sample_gen/config.yaml"
+    tags: ["synthetic", "sample", "testing"]
+
+  - id: ingestion_cfg_gen
+    display_name: "Ingestion Config Generator"
+    description: "Generate Databricks Autoloader ingestion configurations — no LLM cost"
+    category: "Ingestion"
+    type: "non_agentic"
+    icon: "⚙️"
+    enabled: true
+    config_path: "agents/ingestion_cfg/config.yaml"
+    tags: ["ingestion", "autoloader", "pipeline"]

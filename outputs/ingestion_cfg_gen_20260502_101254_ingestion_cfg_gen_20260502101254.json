@@ -1,0 +1,28 @@
+{
+  "status": "success",
+  "output": {
+    "ingestion_configs": [
+      {
+        "source_table": "customer",
+        "target_table": "bronze.customer",
+        "format": "delta",
+        "load_type": "incremental",
+        "autoloader": {
+          "cloudFilesFormat": "json",
+          "inferColumnTypes": true,
+          "schemaLocation": "/checkpoints/customer/schema",
+          "checkpointLocation": "/checkpoints/customer/checkpoint"
+        },
+        "selected_columns": [
+          "customer_id",
+          "email",
+          "country_code",
+          "created_at"
+        ],
+        "generated_at": "2026-05-02T10:12:54.645946+00:00"
+      }
+    ]
+  },
+  "agent_id": "ingestion_cfg_gen",
+  "timestamp": "2026-05-02T10:12:54.645963+00:00"
+}

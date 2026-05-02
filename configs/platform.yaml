@@ -1,0 +1,89 @@
+# =============================================================================
+# Platform-Level Configuration
+# agent_platform/configs/platform.yaml
+#
+# Single source of truth for all global platform settings.
+# Agent-level configs (agents/<name>/config.yaml) may override specific fields.
+# Switch LLM providers by changing the [llm] block only.
+# =============================================================================
+
+platform:
+  name: "Data Engineering Agent Platform"
+  version: "1.0.0"
+  environment: "dev"                        # dev | staging | prod
+
+# -----------------------------------------------------------------------------
+# LLM Provider — Databricks Foundation Model APIs (SSO auth via SDK)
+#
+# model: the serving endpoint to use. Must match exactly what is shown in
+#        Databricks > Machine Learning > Serving.
+#
+# fallback_models: tried in order if `model` is unavailable on this workspace.
+#   Free-tier community workspace available models (May 2025):
+#     databricks-meta-llama-3.1-405b-instruct   (best open-source quality)
+#     databricks-gpt-oss-120b
+#     databricks-qwen3-next-80b-a3b-instruct
+#     databricks-gemma-3-12b
+#     databricks-gpt-oss-20b
+#   Enterprise workspace (Azure/AWS) adds:
+#     databricks-claude-3-7-sonnet              (recommended for production)
+#     databricks-claude-opus-4
+#     databricks-meta-llama-3-3-70b-instruct
+# -----------------------------------------------------------------------------
+llm:
+  provider: "databricks"
+  model: "databricks-meta-llama-3.1-405b-instruct"   # best available on free-tier
+  fallback_models:                                    # tried in order if primary unavailable
+    - "databricks-gpt-oss-120b"
+    - "databricks-qwen3-next-80b-a3b-instruct"
+    - "databricks-gemma-3-12b"
+    - "databricks-gpt-oss-20b"
+  max_tokens: 4096
+  temperature: 0.2                          # Low = deterministic, consistent outputs
+  timeout_seconds: 120
+  retry_attempts: 3
+  retry_backoff_seconds: 5
+
+# -----------------------------------------------------------------------------
+# Token Optimization
+# -----------------------------------------------------------------------------
+token_optimization:
+  enabled: true
+  max_prompt_tokens: 3000                   # Prompt budget (leaves room for response)
+  metadata_only: true                       # NEVER send raw row data to LLM
+  max_sample_values: 5                      # Max distinct sample values per column
+  max_columns_in_prompt: 50                 # Truncate wide tables beyond this
+  knowledge_chunk_size: 500                 # Tokens per knowledge chunk
+  max_knowledge_chunks: 3                   # Max chunks injected per prompt
+  cache_enabled: true
+  cache_ttl_hours: 24
+
+# -----------------------------------------------------------------------------
+# Unity Catalog
+# -----------------------------------------------------------------------------
+unity_catalog:
+  catalog: "agent_platform"
+  schemas:
+    outputs: "outputs"
+    cache: "cache"
+    metadata: "metadata"
+  volumes:
+    knowledge: "/Volumes/agent_platform/knowledge"
+    configs: "/Volumes/agent_platform/configs"
+
+# -----------------------------------------------------------------------------
+# Execution defaults
+# -----------------------------------------------------------------------------
+execution:
+  default_type: "python"                    # python | notebook | sql
+  notebook_base_path: "/agent_platform/notebooks"
+  output_format: "json"
+  enable_output_registration: true
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  log_to_uc: true
+  log_table: "agent_platform.metadata.run_logs"
