@@ -1,5 +1,5 @@
 """
-app/catalog.py — Agent Catalog UI v4
+app/catalog.py — Agent Catalog UI v3
 
 Three input modes per agent:
   A. Unity Catalog / Hive metastore  — type catalog.schema, pick tables
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.orchestrator        import Orchestrator
-from core.metadata_extractor  import MetadataExtractor
+from core.metadata_extractor  import MetadataExtractor, _spark_available
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
