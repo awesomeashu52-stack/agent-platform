@@ -1,148 +1,90 @@
 """
 core/metadata_extractor.py
 
-Extracts rich table metadata from three sources:
-  A. Unity Catalog / Hive metastore  — queries INFORMATION_SCHEMA + DESCRIBE TABLE
-  B. Cloud file path                  — S3, ADLS, GCS via Spark schema inference
-  C. Manual JSON                      — validates and normalises user-provided metadata
+Extracts table metadata from three sources — all work inside a Databricks App
+(no Spark session required for modes A and C):
 
-All three modes produce the same output schema so the rest of the platform
-(agents, prompt builder, token optimizer) works identically regardless of source.
+  A. Unity Catalog / Hive metastore
+     Uses the Databricks SDK catalog APIs (REST) — no Spark needed.
+     For column-level stats (null_pct, distinct_count, sample_values) it runs
+     SQL statements via the SQL Statement Execution API if a warehouse ID is
+     configured, otherwise returns schema-only metadata.
 
-Output schema per table
------------------------
-{
-  "table_name":    str,
-  "database":      str,             # catalog.schema
-  "row_count":     int,
-  "source_mode":   "catalog" | "file" | "manual",
-  "source_path":   str | None,      # original path/table ref
-  "record_source": str | None,      # for DV2 lineage
-  "columns": [
-    {
-      "name":           str,
-      "data_type":      str,
-      "nullable":       bool,
-      "null_pct":       float,      # 0.0 – 1.0
-      "distinct_count": int,
-      "sample_values":  list[str],  # max 5
-      "is_primary_key": bool,
-      "is_foreign_key": bool,
-      "fk_references":  str | None  # "other_table.other_col"
-    }
-  ],
-  "relationships": [               # cross-table FK relationships (filled by RelationshipDetector)
-    {
-      "from_column":  str,
-      "to_table":     str,
-      "to_column":    str,
-      "confidence":   "high" | "medium" | "low"
-    }
-  ]
-}
+  B. Cloud file path (S3 / ADLS / GCS)
+     Requires Spark. Only available when running on a cluster notebook,
+     not inside a Databricks App. The UI shows a clear message when unavailable.
+
+  C. Manual JSON
+     Always available. Validates and normalises user-provided metadata.
+
+All three modes produce identical output — agents see the same structure
+regardless of how the metadata was obtained.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Environment probes
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _spark_available() -> bool:
     try:
-        from pyspark.sql import SparkSession  # type: ignore
+        from pyspark.sql import SparkSession          # type: ignore
         return SparkSession.getActiveSession() is not None
     except Exception:
         return False
 
 
+def _sdk_available() -> bool:
+    try:
+        from databricks.sdk import WorkspaceClient   # type: ignore
+        WorkspaceClient().current_user.me()
+        return True
+    except Exception:
+        return False
+
+
+def _get_sdk():
+    from databricks.sdk import WorkspaceClient       # type: ignore
+    return WorkspaceClient()
+
+
 def _get_spark():
-    from pyspark.sql import SparkSession  # type: ignore
+    from pyspark.sql import SparkSession             # type: ignore
     return SparkSession.getActiveSession()
 
 
-def _safe_distinct(spark, full_table: str, col: str, limit: int = 5) -> list[str]:
-    """Return up to `limit` distinct non-null values for a column as strings."""
-    try:
-        rows = spark.sql(
-            f"SELECT DISTINCT `{col}` FROM {full_table} "
-            f"WHERE `{col}` IS NOT NULL LIMIT {limit}"
-        ).collect()
-        return [str(r[0]) for r in rows]
-    except Exception:
-        return []
-
-
-def _safe_null_pct(spark, full_table: str, col: str, row_count: int) -> float:
-    if row_count == 0:
-        return 0.0
-    try:
-        n = spark.sql(
-            f"SELECT COUNT(*) as n FROM {full_table} WHERE `{col}` IS NULL"
-        ).first()["n"]
-        return round(n / row_count, 4)
-    except Exception:
-        return 0.0
-
-
-def _safe_distinct_count(spark, full_table: str, col: str) -> int:
-    try:
-        return spark.sql(
-            f"SELECT COUNT(DISTINCT `{col}`) as n FROM {full_table}"
-        ).first()["n"]
-    except Exception:
-        return 0
-
-
 def _normalise_dtype(dtype: str) -> str:
-    """Normalise Spark/Hive type strings to simple lowercase names."""
-    dtype = dtype.lower().strip()
-    if dtype.startswith("decimal"):    return "decimal"
-    if dtype.startswith("array"):      return "array"
-    if dtype.startswith("map"):        return "map"
-    if dtype.startswith("struct"):     return "struct"
+    dtype = str(dtype).lower().strip()
+    for prefix in ("decimal","array","map","struct"):
+        if dtype.startswith(prefix):
+            return prefix
     return dtype
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Relationship detector — finds FK links across multiple tables
+# Cross-table relationship detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RelationshipDetector:
     """
-    Infers likely FK relationships between a set of tables based on:
-      1. Column name matching (order.customer_id → customer.customer_id)
-      2. Data type compatibility
-      3. Distinct count ratio (FK col distinct count ≤ PK col distinct count)
-
-    Only works when multiple tables are provided together.
+    Infers FK relationships across tables using column-name heuristics.
+    Example: orders.customer_id → customer.customer_id (high confidence)
     """
 
-    # Patterns that suggest a column is a foreign key pointing to another table
-    # e.g. "customer_id" → likely references "customer" table
     FK_PATTERN = re.compile(r"^(.+?)_id$", re.IGNORECASE)
 
     def detect(self, tables: list[dict]) -> list[dict]:
-        """
-        Annotate each table's columns with is_primary_key, is_foreign_key,
-        fk_references, and populate the top-level relationships list.
-        """
-        # Index: column_name → list of tables that have it
-        col_index: dict[str, list[dict]] = {}
-        for t in tables:
-            for col in t.get("columns", []):
-                name = col["name"].lower()
-                col_index.setdefault(name, []).append(t)
-
-        # Index: table_name → table dict (for fast lookup)
         table_index = {t["table_name"].lower(): t for t in tables}
 
         for t in tables:
@@ -154,54 +96,44 @@ class RelationshipDetector:
                 col.setdefault("is_foreign_key",  False)
                 col.setdefault("fk_references",   None)
 
-                col_name  = col["name"].lower()
-                col_dcount= col.get("distinct_count", 0)
+                col_name   = col["name"].lower()
+                col_dcount = col.get("distinct_count") or 0
+                own_pk     = t["table_name"].lower() + "_id"
 
-                # Heuristic 1: <table_name>_id column with distinct_count = row_count → PK
-                expected_pk = t["table_name"].lower() + "_id"
-                if col_name == expected_pk and col_dcount == row_count and row_count > 0:
+                # PK heuristic: <table>_id column where distinct = row_count
+                if col_name == own_pk and row_count > 0 and col_dcount == row_count:
                     col["is_primary_key"] = True
 
-                # Heuristic 2: col matches pattern <X>_id and table X exists → FK
                 m = self.FK_PATTERN.match(col_name)
-                if m:
-                    ref_table_name = m.group(1).lower()
-                    if ref_table_name != t["table_name"].lower() and ref_table_name in table_index:
-                        ref_table = table_index[ref_table_name]
-                        ref_pk    = ref_table_name + "_id"
+                if not m:
+                    continue
 
-                        # Check the referenced table actually has that PK column
-                        ref_col_names = [c["name"].lower() for c in ref_table.get("columns", [])]
-                        if ref_pk in ref_col_names:
-                            col["is_foreign_key"] = True
-                            col["fk_references"]  = f"{ref_table['table_name']}.{ref_pk}"
+                ref_name = m.group(1).lower()
+                if ref_name == t["table_name"].lower():
+                    continue   # that's the PK, not a FK
 
-                            t["relationships"].append({
-                                "from_column": col["name"],
-                                "to_table":    ref_table["table_name"],
-                                "to_column":   ref_pk,
-                                "confidence":  "high",
-                            })
-                        else:
-                            # Partial match — lower confidence
-                            col["is_foreign_key"] = True
-                            col["fk_references"]  = f"{ref_table['table_name']} (inferred)"
-                            t["relationships"].append({
-                                "from_column": col["name"],
-                                "to_table":    ref_table["table_name"],
-                                "to_column":   "?",
-                                "confidence":  "medium",
-                            })
-
-                # Heuristic 3: col_name == <something>_id but matching table not in set
-                elif m and col_name != expected_pk:
-                    ref_table_name = m.group(1).lower()
+                if ref_name in table_index:
+                    ref_table = table_index[ref_name]
+                    ref_pk    = ref_name + "_id"
+                    ref_cols  = [c["name"].lower() for c in ref_table.get("columns", [])]
+                    confidence = "high" if ref_pk in ref_cols else "medium"
+                    to_col     = ref_pk if ref_pk in ref_cols else "?"
                     col["is_foreign_key"] = True
-                    col["fk_references"]  = f"{ref_table_name} (not in current set)"
+                    col["fk_references"]  = f"{ref_table['table_name']}.{to_col}"
                     t["relationships"].append({
                         "from_column": col["name"],
-                        "to_table":    ref_table_name,
-                        "to_column":   ref_table_name + "_id",
+                        "to_table":    ref_table["table_name"],
+                        "to_column":   to_col,
+                        "confidence":  confidence,
+                    })
+                else:
+                    # Referenced table not in current set
+                    col["is_foreign_key"] = True
+                    col["fk_references"]  = f"{ref_name} (not loaded)"
+                    t["relationships"].append({
+                        "from_column": col["name"],
+                        "to_table":    ref_name,
+                        "to_column":   ref_name + "_id",
                         "confidence":  "low",
                     })
 
@@ -209,169 +141,324 @@ class RelationshipDetector:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mode A — Unity Catalog / Hive metastore
+# SQL Statement Execution API helper (optional stats enrichment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SQLExecutor:
+    """
+    Runs SQL via the Databricks SQL Statement Execution REST API.
+    Used to fetch column stats (null_pct, distinct_count, sample_values)
+    when a SQL warehouse ID is available.
+
+    Warehouse ID is read from env var DATABRICKS_WAREHOUSE_ID or passed in.
+    If not configured, stats are left as None and the schema-only path is used.
+    """
+
+    def __init__(self, ws, warehouse_id: str | None = None):
+        self._ws           = ws
+        self._warehouse_id = (
+            warehouse_id
+            or os.getenv("DATABRICKS_WAREHOUSE_ID", "")
+        ).strip()
+
+    @property
+    def available(self) -> bool:
+        return bool(self._warehouse_id)
+
+    def run(self, sql: str, timeout_seconds: int = 30) -> list[list]:
+        """Execute SQL and return rows as list of lists. Returns [] on error."""
+        if not self.available:
+            return []
+        try:
+            from databricks.sdk.service.sql import StatementState  # type: ignore
+            stmt = self._ws.statement_execution.execute_statement(
+                warehouse_id=self._warehouse_id,
+                statement=sql,
+                wait_timeout=f"{timeout_seconds}s",
+            )
+            # Poll until done
+            deadline = time.time() + timeout_seconds
+            while stmt.status.state in (
+                StatementState.PENDING, StatementState.RUNNING
+            ):
+                if time.time() > deadline:
+                    logger.warning(f"SQL timed out: {sql[:80]}")
+                    return []
+                time.sleep(1)
+                stmt = self._ws.statement_execution.get_statement(stmt.statement_id)
+
+            if stmt.status.state != StatementState.SUCCEEDED:
+                logger.warning(f"SQL failed ({stmt.status.state}): {sql[:80]}")
+                return []
+
+            if not stmt.result or not stmt.result.data_array:
+                return []
+            return stmt.result.data_array           # list of lists
+
+        except Exception as e:
+            logger.debug(f"SQL execution error: {e}")
+            return []
+
+    def scalar(self, sql: str) -> Any:
+        """Return the first cell of the first row, or None."""
+        rows = self.run(sql)
+        return rows[0][0] if rows else None
+
+    def column_stats(self, full_table: str, col: str, row_count: int) -> dict:
+        """Fetch null_pct, distinct_count, and sample_values for one column."""
+        stats = {"null_pct": None, "distinct_count": None, "sample_values": []}
+        if not self.available or row_count == 0:
+            return stats
+
+        try:
+            null_count = int(self.scalar(
+                f"SELECT COUNT(*) FROM {full_table} WHERE `{col}` IS NULL"
+            ) or 0)
+            stats["null_pct"] = round(null_count / max(row_count, 1), 4)
+        except Exception:
+            pass
+
+        try:
+            stats["distinct_count"] = int(self.scalar(
+                f"SELECT COUNT(DISTINCT `{col}`) FROM {full_table}"
+            ) or 0)
+        except Exception:
+            pass
+
+        try:
+            rows = self.run(
+                f"SELECT DISTINCT `{col}` FROM {full_table} "
+                f"WHERE `{col}` IS NOT NULL LIMIT 5"
+            )
+            stats["sample_values"] = [str(r[0]) for r in rows if r[0] is not None]
+        except Exception:
+            pass
+
+        return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode A — Unity Catalog / Hive metastore via SDK (no Spark needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CatalogExtractor:
     """
-    Extracts metadata for all tables in a given catalog.schema using Spark.
-    Falls back gracefully if a table can't be described.
+    Extracts table schemas using the Databricks SDK catalog REST APIs.
+    Works inside Databricks Apps, notebooks, and local dev.
+
+    Column stats (null_pct, distinct_count, sample_values) are fetched
+    via the SQL Statement Execution API if DATABRICKS_WAREHOUSE_ID is set.
+    Without it, schema-only metadata is returned (still fully usable by agents).
+
+    Supports both Unity Catalog (3-level: catalog.schema.table)
+    and Hive metastore (2-level: schema.table → hive_metastore.schema.table).
     """
 
-    def extract_schema(self, catalog_schema: str, record_source_prefix: str = "") -> list[dict]:
-        """
-        Extract metadata for every table in `catalog_schema` (e.g. "crm_prod.raw").
+    def __init__(self, warehouse_id: str | None = None):
+        self._ws  = _get_sdk()
+        self._sql = _SQLExecutor(self._ws, warehouse_id)
 
-        Parameters
-        ----------
-        catalog_schema      : "catalog.schema" or just "schema"
-        record_source_prefix: prepended to table name for record_source field
-                              e.g. "salesforce.crm" → record_source = "salesforce.crm.customer"
-        """
-        if not _spark_available():
-            raise RuntimeError(
-                "No active Spark session. "
-                "CatalogExtractor requires Databricks or a running SparkSession."
-            )
-        spark = _get_spark()
+    # ── Public ────────────────────────────────────────────────────────────────
 
-        # List all tables in the schema
+    def list_catalogs(self) -> list[str]:
+        """Return all catalog names visible to the current user."""
         try:
-            tables_df = spark.sql(f"SHOW TABLES IN {catalog_schema}")
-            table_names = [r["tableName"] for r in tables_df.collect()]
+            return [c.name for c in self._ws.catalogs.list() if c.name]
         except Exception as e:
-            raise RuntimeError(f"Cannot list tables in {catalog_schema}: {e}") from e
+            logger.warning(f"Cannot list catalogs: {e}")
+            return []
 
-        logger.info(f"CatalogExtractor: found {len(table_names)} tables in {catalog_schema}")
+    def list_schemas(self, catalog_name: str) -> list[str]:
+        """Return all schema names in a catalog."""
+        try:
+            return [
+                s.name for s in self._ws.schemas.list(catalog_name=catalog_name)
+                if s.name
+            ]
+        except Exception as e:
+            logger.warning(f"Cannot list schemas in {catalog_name}: {e}")
+            return []
 
-        results = []
-        for table_name in table_names:
-            try:
-                meta = self.extract_table(
-                    catalog_schema=catalog_schema,
-                    table_name=table_name,
-                    record_source_prefix=record_source_prefix,
+    def list_tables(self, catalog_name: str, schema_name: str) -> list[str]:
+        """Return all table names in a catalog.schema."""
+        try:
+            return [
+                t.name
+                for t in self._ws.tables.list(
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
                 )
-                results.append(meta)
-                logger.info(f"  Extracted: {table_name} ({meta['row_count']:,} rows)")
-            except Exception as e:
-                logger.warning(f"  Skipped {table_name}: {e}")
+                if t.name
+            ]
+        except Exception as e:
+            logger.warning(f"Cannot list tables in {catalog_name}.{schema_name}: {e}")
+            return []
 
+    def extract_schema(
+        self,
+        catalog_name: str,
+        schema_name:  str,
+        table_names:  list[str] | None = None,
+        record_source_prefix: str = "",
+    ) -> list[dict]:
+        """Extract metadata for all (or specified) tables in catalog.schema."""
+        names = table_names or self.list_tables(catalog_name, schema_name)
+        if not names:
+            raise RuntimeError(
+                f"No tables found in {catalog_name}.{schema_name}. "
+                "Check the catalog and schema names and your access permissions."
+            )
+        results = []
+        for name in names:
+            try:
+                meta = self.extract_table(catalog_name, schema_name, name, record_source_prefix)
+                results.append(meta)
+                logger.info(f"  Extracted: {name} ({len(meta['columns'])} cols)")
+            except Exception as e:
+                logger.warning(f"  Skipped {name}: {e}")
         return results
 
     def extract_table(
         self,
-        catalog_schema: str,
-        table_name: str,
+        catalog_name: str,
+        schema_name:  str,
+        table_name:   str,
         record_source_prefix: str = "",
     ) -> dict:
-        """Extract metadata for a single table."""
-        spark      = _get_spark()
-        full_table = f"{catalog_schema}.{table_name}"
+        """Extract metadata for a single table using the SDK tables API."""
 
-        # Row count
+        full_ref = f"{catalog_name}.{schema_name}.{table_name}"
+
+        # ── Get table info from SDK ────────────────────────────────────────
         try:
-            row_count = spark.sql(f"SELECT COUNT(*) as n FROM {full_table}").first()["n"]
-        except Exception:
-            row_count = 0
+            table_info = self._ws.tables.get(full_name=full_ref)
+        except Exception as e:
+            raise RuntimeError(f"Cannot retrieve table info for {full_ref}: {e}") from e
 
-        # Schema
-        schema_rows = spark.sql(f"DESCRIBE TABLE {full_table}").collect()
+        # ── Row count ─────────────────────────────────────────────────────
+        row_count = 0
+        # Try from table properties first (cheap)
+        if table_info.properties:
+            rc = table_info.properties.get("numRows") or table_info.properties.get("delta.numRows")
+            if rc:
+                try: row_count = int(rc)
+                except Exception: pass
+
+        # Fall back to SQL count if warehouse available and no property
+        if row_count == 0 and self._sql.available:
+            try:
+                row_count = int(self._sql.scalar(f"SELECT COUNT(*) FROM {full_ref}") or 0)
+            except Exception:
+                pass
+
+        # ── Columns ───────────────────────────────────────────────────────
         columns = []
-        for row in schema_rows:
-            col_name = row["col_name"]
-            if not col_name or col_name.startswith("#") or col_name.startswith("--"):
-                continue
-            dtype = _normalise_dtype(row.get("data_type", "string"))
+        col_infos = table_info.columns or []
 
-            # Per-column stats
-            null_pct      = _safe_null_pct(spark, full_table, col_name, row_count)
-            distinct_count= _safe_distinct_count(spark, full_table, col_name)
-            sample_values = _safe_distinct(spark, full_table, col_name, limit=5)
+        for col in col_infos:
+            col_name  = col.name
+            dtype     = _normalise_dtype(col.type_text or col.type_name or "string")
+            nullable  = col.nullable if col.nullable is not None else True
+
+            # Column stats via SQL warehouse (optional)
+            if self._sql.available and row_count > 0:
+                stats = self._sql.column_stats(full_ref, col_name, row_count)
+            else:
+                stats = {"null_pct": None, "distinct_count": None, "sample_values": []}
 
             columns.append({
                 "name":           col_name,
                 "data_type":      dtype,
-                "nullable":       True,       # refined by RelationshipDetector
-                "null_pct":       null_pct,
-                "distinct_count": distinct_count,
-                "sample_values":  sample_values,
+                "nullable":       nullable,
+                "null_pct":       stats["null_pct"],
+                "distinct_count": stats["distinct_count"],
+                "sample_values":  stats["sample_values"],
                 "is_primary_key": False,
                 "is_foreign_key": False,
                 "fk_references":  None,
             })
 
         record_source = (
-            f"{record_source_prefix}.{table_name}" if record_source_prefix
-            else full_table
+            f"{record_source_prefix}.{table_name}"
+            if record_source_prefix else full_ref
         )
 
         return {
             "table_name":    table_name,
-            "database":      catalog_schema,
+            "database":      f"{catalog_name}.{schema_name}",
             "row_count":     row_count,
             "source_mode":   "catalog",
-            "source_path":   full_table,
+            "source_path":   full_ref,
             "record_source": record_source,
             "columns":       columns,
             "relationships": [],
         }
 
+    @staticmethod
+    def parse_catalog_schema(catalog_schema: str) -> tuple[str, str]:
+        """
+        Parse a user-provided string into (catalog_name, schema_name).
+
+        Accepts:
+          "samples.tpch"              → ("samples", "tpch")
+          "hive_metastore.default"    → ("hive_metastore", "default")
+          "default"                   → ("hive_metastore", "default")
+        """
+        parts = [p.strip() for p in catalog_schema.strip().split(".") if p.strip()]
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        if len(parts) == 1:
+            return "hive_metastore", parts[0]
+        raise ValueError(
+            f"Cannot parse '{catalog_schema}' as catalog.schema. "
+            "Use the format: catalog_name.schema_name  (e.g. samples.tpch)"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mode B — Cloud file path (S3 / ADLS / GCS)
+# Mode B — Cloud file path via Spark (cluster/notebook only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FileExtractor:
     """
-    Infers schema and computes column stats from a cloud file path.
-    Reads a configurable sample size to keep costs low.
-    Supports: parquet, delta, csv, json, avro.
+    Reads a cloud file path with Spark schema inference.
+    Requires an active SparkSession — available on cluster notebooks,
+    NOT inside a Databricks App container.
     """
 
     SUPPORTED_FORMATS = ["parquet", "delta", "csv", "json", "avro"]
 
     def extract(
         self,
-        path: str,
-        file_format: str = "parquet",
-        sample_rows: int = 10_000,
-        table_name: str | None = None,
+        path:         str,
+        file_format:  str = "parquet",
+        sample_rows:  int = 10_000,
+        table_name:   str | None = None,
     ) -> dict:
-        """
-        Parameters
-        ----------
-        path        : cloud path e.g. s3://bucket/prefix/ or abfss://...
-        file_format : parquet | delta | csv | json | avro
-        sample_rows : how many rows to read for stats (default 10k — low cost)
-        table_name  : override for the inferred table name (defaults to last path segment)
-        """
         if not _spark_available():
             raise RuntimeError(
-                "No active Spark session. "
-                "FileExtractor requires Databricks or a running SparkSession."
+                "No active Spark session.\n\n"
+                "File path extraction requires a running Spark cluster. "
+                "This mode is available in Databricks notebooks but NOT inside "
+                "a Databricks App.\n\n"
+                "To use file data in the App: run the extraction in a notebook "
+                "first (using the MetadataExtractor helper), copy the JSON output, "
+                "and paste it into the 'Paste JSON manually' tab."
             )
-        spark = _get_spark()
 
+        spark      = _get_spark()
         file_format = file_format.lower()
         if file_format not in self.SUPPORTED_FORMATS:
-            raise ValueError(
-                f"Unsupported format: {file_format}. "
-                f"Choose from: {self.SUPPORTED_FORMATS}"
-            )
+            raise ValueError(f"Unsupported format '{file_format}'. Choose from: {self.SUPPORTED_FORMATS}")
 
-        # Infer table name from path
         if not table_name:
             table_name = path.rstrip("/").split("/")[-1].split(".")[0] or "file_table"
 
-        logger.info(f"FileExtractor: reading {file_format} from {path} (sample={sample_rows})")
-
-        # Read sample
         try:
             if file_format == "delta":
                 df = spark.read.format("delta").load(path)
             elif file_format == "csv":
-                df = spark.read.option("header", "true").option("inferSchema", "true").csv(path)
+                df = spark.read.option("header","true").option("inferSchema","true").csv(path)
             elif file_format == "json":
                 df = spark.read.json(path)
             elif file_format == "avro":
@@ -379,61 +466,37 @@ class FileExtractor:
             else:
                 df = spark.read.parquet(path)
 
-            # Sample for stats
-            total_count  = df.count()
-            sample_df    = df.limit(sample_rows)
-            sample_count = min(sample_rows, total_count)
-
+            total_count = df.count()
+            sample_df   = df.limit(sample_rows)
         except Exception as e:
-            raise RuntimeError(f"Cannot read file at {path}: {e}") from e
+            raise RuntimeError(f"Cannot read {file_format} file at {path}: {e}") from e
 
-        # Register as temp view for SQL stats
-        view_name = f"__fe_{table_name}_{abs(hash(path)) % 100000}"
-        sample_df.createOrReplaceTempView(view_name)
+        view = f"__fe_{table_name}_{abs(hash(path)) % 100000}"
+        sample_df.createOrReplaceTempView(view)
+        sample_n = min(sample_rows, total_count)
 
         columns = []
         for field in sample_df.schema.fields:
             col_name = field.name
             dtype    = _normalise_dtype(str(field.dataType))
-
-            null_count    = spark.sql(
-                f"SELECT COUNT(*) as n FROM {view_name} WHERE `{col_name}` IS NULL"
-            ).first()["n"]
-            null_pct      = round(null_count / max(sample_count, 1), 4)
-            distinct_count= spark.sql(
-                f"SELECT COUNT(DISTINCT `{col_name}`) as n FROM {view_name}"
-            ).first()["n"]
-            sample_values = [
-                str(r[0]) for r in spark.sql(
-                    f"SELECT DISTINCT `{col_name}` FROM {view_name} "
-                    f"WHERE `{col_name}` IS NOT NULL LIMIT 5"
-                ).collect()
-            ]
-
+            null_n   = spark.sql(f"SELECT COUNT(*) FROM {view} WHERE `{col_name}` IS NULL").first()[0]
+            dist_n   = spark.sql(f"SELECT COUNT(DISTINCT `{col_name}`) FROM {view}").first()[0]
+            samples  = [str(r[0]) for r in spark.sql(
+                f"SELECT DISTINCT `{col_name}` FROM {view} WHERE `{col_name}` IS NOT NULL LIMIT 5"
+            ).collect()]
             columns.append({
-                "name":           col_name,
-                "data_type":      dtype,
-                "nullable":       field.nullable,
-                "null_pct":       null_pct,
-                "distinct_count": distinct_count,
-                "sample_values":  sample_values,
-                "is_primary_key": False,
-                "is_foreign_key": False,
-                "fk_references":  None,
+                "name": col_name, "data_type": dtype, "nullable": field.nullable,
+                "null_pct": round(null_n / max(sample_n,1), 4),
+                "distinct_count": dist_n, "sample_values": samples,
+                "is_primary_key": False, "is_foreign_key": False, "fk_references": None,
             })
 
-        # Drop temp view
-        spark.catalog.dropTempView(view_name)
+        spark.catalog.dropTempView(view)
 
         return {
-            "table_name":    table_name,
-            "database":      path,
-            "row_count":     total_count,
-            "source_mode":   "file",
-            "source_path":   path,
-            "record_source": path,
-            "columns":       columns,
-            "relationships": [],
+            "table_name": table_name, "database": path, "row_count": total_count,
+            "source_mode": "file", "source_path": path, "record_source": path,
+            "columns": columns, "relationships": [],
         }
 
 
@@ -442,57 +505,42 @@ class FileExtractor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ManualExtractor:
-    """
-    Validates and normalises user-provided metadata JSON.
-    Fills in missing optional fields with sensible defaults so the
-    rest of the platform always sees a complete metadata object.
-    """
+    """Validates and normalises user-provided metadata JSON."""
 
-    REQUIRED_FIELDS = {"table_name", "columns"}
-    REQUIRED_COL_FIELDS = {"name", "data_type"}
-
-    def normalise(self, raw: list[dict] | dict) -> list[dict]:
-        """
-        Accept either a single table dict or a list, validate, and normalise.
-        Raises ValueError with a clear message on validation failure.
-        """
+    def normalise(self, raw: list | dict) -> list[dict]:
         if isinstance(raw, dict):
             raw = [raw]
-        if not isinstance(raw, list) or len(raw) == 0:
-            raise ValueError("Metadata must be a JSON object or non-empty array of objects.")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("Metadata must be a JSON object or non-empty array.")
 
-        normalised = []
+        out = []
         for i, table in enumerate(raw):
-            missing = self.REQUIRED_FIELDS - set(table.keys())
-            if missing:
-                raise ValueError(
-                    f"Table {i+1} is missing required fields: {missing}. "
-                    f"Every table must have at least 'table_name' and 'columns'."
-                )
-            if not isinstance(table["columns"], list) or len(table["columns"]) == 0:
-                raise ValueError(f"Table '{table['table_name']}' has no columns.")
-
-            normalised_cols = []
+            if "table_name" not in table:
+                raise ValueError(f"Table {i+1}: missing required field 'table_name'.")
+            if "columns" not in table or not table["columns"]:
+                raise ValueError(f"Table '{table['table_name']}': missing or empty 'columns'.")
             for j, col in enumerate(table["columns"]):
-                missing_col = self.REQUIRED_COL_FIELDS - set(col.keys())
-                if missing_col:
+                if "name" not in col or "data_type" not in col:
                     raise ValueError(
-                        f"Column {j+1} in '{table['table_name']}' is missing: {missing_col}. "
-                        f"Every column must have at least 'name' and 'data_type'."
+                        f"Column {j+1} in '{table['table_name']}': "
+                        "each column needs at least 'name' and 'data_type'."
                     )
-                normalised_cols.append({
-                    "name":           col["name"],
-                    "data_type":      _normalise_dtype(col.get("data_type", "string")),
-                    "nullable":       col.get("nullable", True),
-                    "null_pct":       col.get("null_pct", None),
-                    "distinct_count": col.get("distinct_count", None),
-                    "sample_values":  col.get("sample_values", [])[:5],
-                    "is_primary_key": col.get("is_primary_key", False),
-                    "is_foreign_key": col.get("is_foreign_key", False),
-                    "fk_references":  col.get("fk_references", None),
-                })
 
-            normalised.append({
+            normalised_cols = [
+                {
+                    "name":           c["name"],
+                    "data_type":      _normalise_dtype(c.get("data_type","string")),
+                    "nullable":       c.get("nullable", True),
+                    "null_pct":       c.get("null_pct", None),
+                    "distinct_count": c.get("distinct_count", None),
+                    "sample_values":  c.get("sample_values", [])[:5],
+                    "is_primary_key": c.get("is_primary_key", False),
+                    "is_foreign_key": c.get("is_foreign_key", False),
+                    "fk_references":  c.get("fk_references", None),
+                }
+                for c in table["columns"]
+            ]
+            out.append({
                 "table_name":    table["table_name"],
                 "database":      table.get("database", ""),
                 "row_count":     table.get("row_count", 0),
@@ -501,12 +549,11 @@ class ManualExtractor:
                 "record_source": table.get("record_source", None),
                 "columns":       normalised_cols,
                 "relationships": table.get("relationships", []),
-                # Preserve any extra fields the user added (e.g. role, existing_dq_rules)
                 **{k: v for k, v in table.items()
-                   if k not in {"table_name","database","row_count","columns","relationships"}},
+                   if k not in {"table_name","database","row_count",
+                                "columns","relationships","source_mode","source_path"}},
             })
-
-        return normalised
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,57 +566,81 @@ class MetadataExtractor:
 
     Usage
     -----
-    extractor = MetadataExtractor()
+    ex = MetadataExtractor()
 
-    # Mode A: catalog
-    tables = extractor.from_catalog("crm_prod.raw", record_source_prefix="salesforce")
+    # Mode A — catalog (works in App and notebooks)
+    tables = ex.from_catalog("samples", "tpch", table_names=["customer","orders"])
+    tables = ex.from_catalog("samples", "tpch")          # all tables in schema
 
-    # Mode B: file
-    tables = extractor.from_file("s3://bucket/customer/", file_format="parquet")
+    # Mode B — file (notebooks only, not in App)
+    tables = ex.from_file("s3://bucket/customer/", file_format="parquet")
 
-    # Mode C: manual JSON (string or already-parsed list)
-    tables = extractor.from_manual('[{"table_name": "customer", "columns": [...]}]')
+    # Mode C — manual JSON (always works)
+    tables = ex.from_manual('[{"table_name":"customer","columns":[...]}]')
 
-    # In all cases: run relationship detection before passing to agents
-    tables = extractor.detect_relationships(tables)
+    # Always run relationship detection when multiple tables are loaded
+    tables = ex.detect_relationships(tables)
+    print(ex.summary(tables))
     """
 
-    def __init__(self):
-        self._catalog = CatalogExtractor()
-        self._file    = FileExtractor()
-        self._manual  = ManualExtractor()
-        self._rel     = RelationshipDetector()
+    def __init__(self, warehouse_id: str | None = None):
+        self._cat    = None          # lazy-init — avoids SDK errors at import time
+        self._file   = FileExtractor()
+        self._manual = ManualExtractor()
+        self._rel    = RelationshipDetector()
+        self._wh_id  = warehouse_id or os.getenv("DATABRICKS_WAREHOUSE_ID","")
+
+    def _get_catalog_extractor(self) -> CatalogExtractor:
+        if self._cat is None:
+            self._cat = CatalogExtractor(warehouse_id=self._wh_id)
+        return self._cat
+
+    # ── Mode A ────────────────────────────────────────────────────────────────
 
     def from_catalog(
+        self,
+        catalog_name: str,
+        schema_name:  str,
+        table_names:  list[str] | None = None,
+        record_source_prefix: str = "",
+    ) -> list[dict]:
+        ext = self._get_catalog_extractor()
+        return ext.extract_schema(catalog_name, schema_name, table_names, record_source_prefix)
+
+    def from_catalog_string(
         self,
         catalog_schema: str,
         table_names: list[str] | None = None,
         record_source_prefix: str = "",
     ) -> list[dict]:
-        """
-        Extract all tables from a catalog.schema.
-        If table_names is provided, only those tables are extracted.
-        """
-        if table_names:
-            return [
-                self._catalog.extract_table(catalog_schema, t, record_source_prefix)
-                for t in table_names
-            ]
-        return self._catalog.extract_schema(catalog_schema, record_source_prefix)
+        """Convenience: accepts 'catalog.schema' as a single string."""
+        ext = self._get_catalog_extractor()
+        cat, sch = ext.parse_catalog_schema(catalog_schema)
+        return self.from_catalog(cat, sch, table_names, record_source_prefix)
+
+    def list_catalogs(self) -> list[str]:
+        return self._get_catalog_extractor().list_catalogs()
+
+    def list_schemas(self, catalog: str) -> list[str]:
+        return self._get_catalog_extractor().list_schemas(catalog)
+
+    def list_tables(self, catalog: str, schema: str) -> list[str]:
+        return self._get_catalog_extractor().list_tables(catalog, schema)
+
+    # ── Mode B ────────────────────────────────────────────────────────────────
 
     def from_file(
         self,
         path: str,
         file_format: str = "parquet",
         sample_rows: int = 10_000,
-        table_name: str | None = None,
+        table_name:  str | None = None,
     ) -> list[dict]:
-        """Extract schema and stats from a cloud file path."""
-        result = self._file.extract(path, file_format, sample_rows, table_name)
-        return [result]
+        return [self._file.extract(path, file_format, sample_rows, table_name)]
 
-    def from_manual(self, raw: str | list[dict] | dict) -> list[dict]:
-        """Parse, validate, and normalise user-provided JSON metadata."""
+    # ── Mode C ────────────────────────────────────────────────────────────────
+
+    def from_manual(self, raw: str | list | dict) -> list[dict]:
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -577,26 +648,28 @@ class MetadataExtractor:
                 raise ValueError(f"Invalid JSON: {e}") from e
         return self._manual.normalise(raw)
 
+    # ── Shared ────────────────────────────────────────────────────────────────
+
     def detect_relationships(self, tables: list[dict]) -> list[dict]:
-        """
-        Run cross-table relationship detection.
-        Should always be called after extraction when multiple tables are present.
-        """
         if len(tables) > 1:
             tables = self._rel.detect(tables)
         return tables
 
     def summary(self, tables: list[dict]) -> str:
-        """Return a human-readable summary of extracted tables."""
         lines = [f"{len(tables)} table(s) loaded:"]
         for t in tables:
-            mode  = t.get("source_mode", "?")
-            cols  = len(t.get("columns", []))
-            rows  = t.get("row_count", 0)
-            rels  = len(t.get("relationships", []))
+            mode = {"catalog":"🗄️ catalog","file":"📁 file","manual":"✏️ manual"}.get(
+                t.get("source_mode","manual"), "📋")
+            rels = len(t.get("relationships", []))
+            stats_note = ""
+            if any(c.get("null_pct") is not None for c in t.get("columns",[])):
+                stats_note = " · column stats included"
+            else:
+                stats_note = " · schema only (no stats)"
             lines.append(
                 f"  • {t['table_name']} [{mode}] — "
-                f"{cols} columns, {rows:,} rows"
-                + (f", {rels} FK relationships detected" if rels else "")
+                f"{len(t.get('columns',[]))} cols, {t.get('row_count',0):,} rows"
+                + stats_note
+                + (f", {rels} FK links" if rels else "")
             )
         return "\n".join(lines)
