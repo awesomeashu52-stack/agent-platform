@@ -1,211 +1,577 @@
 """
-app/catalog.py — Agent Catalog UI
+app/catalog.py — Agent Catalog UI v3
 
-Streamlit application hosted on Databricks.
-Run with:  streamlit run app/catalog.py
+Three input modes per agent:
+  A. Unity Catalog / Hive metastore  — type catalog.schema, pick tables
+  B. Cloud file path                  — paste S3/ADLS/GCS path
+  C. Manual JSON                      — paste or edit metadata directly
 
-Architecture:
-  - Reads agent registry from ConfigLoader (no hardcoded agent list)
-  - Builds input forms dynamically per agent
-  - Calls Orchestrator.run() and displays structured output
-  - Shows session-level cost and token tracking in the sidebar
+Multi-table workspace: users build up a list of tables across sessions
+before running an agent. Relationship detection runs automatically.
 """
 
 from __future__ import annotations
-
-import json
-import sys
+import json, sys
 from pathlib import Path
 
 import streamlit as st
 
-# Make project root importable
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core.orchestrator import Orchestrator
+from core.orchestrator        import Orchestrator
+from core.metadata_extractor  import MetadataExtractor
 
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
+# ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Data Engineering Agent Platform",
+    page_title="DE Agent Platform",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
-if "orchestrator" not in st.session_state:
-    st.session_state.orchestrator = Orchestrator(base_dir=ROOT)
-if "results_history" not in st.session_state:
-    st.session_state.results_history = []
+# ── session state ─────────────────────────────────────────────────────────────
+def _init_state():
+    defaults = {
+        "orchestrator": Orchestrator(base_dir=ROOT),
+        "extractor":    MetadataExtractor(),
+        "history":      [],
+        "loaded_tables":[],      # list of metadata dicts built up by the user
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-orch: Orchestrator = st.session_state.orchestrator
+_init_state()
+orch:      Orchestrator       = st.session_state.orchestrator
+extractor: MetadataExtractor  = st.session_state.extractor
 
-# ---------------------------------------------------------------------------
-# Sidebar — catalog + session stats
-# ---------------------------------------------------------------------------
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AGENT FORM DEFINITIONS
+# what_is_input   — plain-English explanation shown in the info box
+# needs_multi     — True if the agent should see ALL loaded tables
+# extra_fields    — list of additional controls beyond the table workspace
+# min_tables      — minimum tables required before Run is enabled
+# ═════════════════════════════════════════════════════════════════════════════
+AGENT_FORMS = {
+    "data_model_gen": {
+        "what_is_input": (
+            "Load **all source tables** that belong to the same subject area "
+            "(e.g. customer, orders, order_items, products). "
+            "The agent reads the relationships between them to correctly decide "
+            "which tables share a Hub, which form a Link, and which become Satellites — "
+            "preventing hub explosion and correctly modelling many-to-many relationships."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "selectbox", "key": "model_type", "label": "Target model type",
+             "options": ["Data Vault 2.0 (silver layer)", "Dimensional model (gold layer)"]},
+            {"type": "selectbox", "key": "hash_algo",  "label": "Hash key algorithm",
+             "options": ["SHA-256", "MD5"]},
+            {"type": "text_input", "key": "target_schema", "label": "Target schema (optional)",
+             "placeholder": "e.g. prod_silver or agent_platform.silver"},
+        ],
+    },
+    "test_case_gen": {
+        "what_is_input": (
+            "Load the **target table(s)** you want to test. "
+            "If you load multiple tables, the agent also generates "
+            "cross-table referential integrity tests "
+            "(e.g. every order.customer_id must exist in customer.customer_id)."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "text_area", "key": "business_rules",
+             "label": "Business rules to cover (one per line)",
+             "placeholder": "country_code must be a valid ISO 3166-1 alpha-2 code\nemail must be unique per customer",
+             "height": 100},
+        ],
+    },
+    "test_query_gen": {
+        "what_is_input": (
+            "Load the **target table(s)**. The agent writes executable Databricks SQL — "
+            "each query returns 0 (pass) or a positive count (failures found). "
+            "Multiple tables generate cross-table FK queries automatically."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "text_input", "key": "catalog_schema", "label": "Fully qualified prefix for SQL",
+             "placeholder": "e.g. agent_platform.silver"},
+        ],
+    },
+    "dq_recommender": {
+        "what_is_input": (
+            "Load one or more tables. For each table, the agent recommends "
+            "column-level and table-level DQ rules based on data types, null rates, "
+            "and distinct counts. Loading multiple tables also generates "
+            "referential integrity rules across FK relationships."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "multiselect", "key": "rule_priorities", "label": "Include priorities",
+             "options": ["P1 — Critical","P2 — High","P3 — Medium","P4 — Low"],
+             "default": ["P1 — Critical","P2 — High","P3 — Medium"]},
+        ],
+    },
+    "dq_query_gen": {
+        "what_is_input": (
+            "Load your table(s) **and paste the DQ rules** from a previous "
+            "DQ Recommender run into the 'Existing DQ rules JSON' box below. "
+            "The agent converts each rule into an executable SQL query."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "text_input", "key": "catalog_schema", "label": "Fully qualified prefix for SQL",
+             "placeholder": "e.g. agent_platform.silver"},
+            {"type": "text_area", "key": "existing_rules_json",
+             "label": "Existing DQ rules JSON (from dq_recommender output)",
+             "placeholder": '[{"rule_id":"DQ_001","rule_type":"NOT_NULL","column":"customer_hk",...}]',
+             "height": 120},
+        ],
+    },
+    "lineage_creator": {
+        "what_is_input": (
+            "Load **all tables in the pipeline** — source, intermediate, and target. "
+            "The agent maps the full upstream → downstream data flow. "
+            "The more tables you load, the more complete the lineage graph."
+        ),
+        "needs_multi": True,
+        "min_tables": 2,
+        "extra_fields": [
+            {"type": "text_area", "key": "pipeline_description",
+             "label": "Pipeline description",
+             "placeholder": "Daily batch load from Salesforce CRM via Autoloader into DV2 silver layer, then aggregated into gold dimensional model.",
+             "height": 80},
+        ],
+    },
+    "sttm_gen": {
+        "what_is_input": (
+            "Load exactly **two tables**: first the source, then the target. "
+            "Mark each with role='source' or role='target' using the JSON editor, "
+            "or use the catalog/file loaders and set the role in the table options below. "
+            "The agent maps every target column to a source column with the exact SQL transform."
+        ),
+        "needs_multi": True,
+        "min_tables": 2,
+        "extra_fields": [
+            {"type": "selectbox", "key": "load_type", "label": "Load type",
+             "options": ["incremental", "full", "streaming"]},
+            {"type": "text_input", "key": "record_source_value",
+             "label": "RECORD_SOURCE value",
+             "placeholder": "e.g. salesforce.crm.contact"},
+        ],
+    },
+    "data_profiler": {
+        "what_is_input": (
+            "Load one or more tables from your catalog or a file path. "
+            "The profiler computes row counts, null rates, distinct counts, "
+            "and sample values for every column. No LLM used — free to run."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [],
+    },
+    "sample_gen": {
+        "what_is_input": (
+            "Load one or more tables. The generator produces synthetic rows "
+            "matching the schema — realistic values, no real PII."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "number_input", "key": "num_rows", "label": "Rows per table",
+             "min_value": 1, "max_value": 50, "default": 5},
+        ],
+    },
+    "ingestion_cfg_gen": {
+        "what_is_input": (
+            "Load your source table(s) or point at a file path. "
+            "The generator produces Databricks Autoloader configurations "
+            "ready to paste into a DLT pipeline. No LLM used — free to run."
+        ),
+        "needs_multi": True,
+        "min_tables": 1,
+        "extra_fields": [
+            {"type": "selectbox", "key": "load_type", "label": "Load type",
+             "options": ["incremental","full","streaming"]},
+            {"type": "selectbox", "key": "source_format", "label": "Source file format",
+             "options": ["parquet","delta","csv","json","avro"]},
+            {"type": "text_input", "key": "source_path", "label": "Source path (optional)",
+             "placeholder": "e.g. abfss://raw@storage.dfs.core.windows.net/crm/"},
+        ],
+    },
+}
+
+# ── sample defaults shown in JSON editor ──────────────────────────────────────
+SAMPLE_TABLE = {
+    "table_name": "customer", "database": "crm_prod", "row_count": 1200000,
+    "columns": [
+        {"name":"customer_id","data_type":"string","nullable":False,
+         "null_pct":0.0,"distinct_count":1200000,"sample_values":["CUST-0001","CUST-0002"]},
+        {"name":"email","data_type":"string","nullable":True,
+         "null_pct":0.05,"distinct_count":1150000,"sample_values":["a@example.com"]},
+        {"name":"country_code","data_type":"string","nullable":False,
+         "null_pct":0.0,"distinct_count":45,"sample_values":["GB","US","DE","IN"]},
+        {"name":"created_at","data_type":"timestamp","nullable":False,
+         "null_pct":0.0,"distinct_count":1200000},
+    ]
+}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIDEBAR — agent selector + session stats
+# ═════════════════════════════════════════════════════════════════════════════
+
 with st.sidebar:
     st.markdown("## 🤖 Agent Catalog")
     st.markdown("---")
 
-    # Category filter
-    all_agents  = orch.list_agents(enabled_only=True)
-    categories  = sorted({a["category"] for a in all_agents})
-    sel_category = st.selectbox("Filter by category", ["All"] + categories)
+    all_agents   = orch.list_agents(enabled_only=True)
+    categories   = sorted({a["category"] for a in all_agents})
+    sel_category = st.selectbox("Category", ["All"] + categories)
+    sel_type     = st.radio("Type", ["All","LLM agents","Free (no LLM)"], horizontal=True)
+    type_map     = {"All":None,"LLM agents":"agentic","Free (no LLM)":"non_agentic"}
 
-    # Type filter
-    sel_type = st.radio("Agent type", ["All", "Agentic (LLM)", "Non-agentic (free)"],
-                        horizontal=True)
-    type_map = {"All": None, "Agentic (LLM)": "agentic", "Non-agentic (free)": "non_agentic"}
-
-    filtered = orch.list_agents(
+    filtered     = orch.list_agents(
         agent_type=type_map[sel_type],
-        category=None if sel_category == "All" else sel_category,
+        category=None if sel_category=="All" else sel_category,
     )
-
-    # Agent selector
     agent_labels = {f"{a['icon']}  {a['display_name']}": a["id"] for a in filtered}
     chosen_label = st.radio("Select agent", list(agent_labels.keys()))
     chosen_id    = agent_labels[chosen_label]
-    chosen_meta  = next(a for a in filtered if a["id"] == chosen_id)
+    chosen_meta  = next(a for a in filtered if a["id"]==chosen_id)
 
     st.markdown("---")
-    st.markdown("### 📊 Session stats")
+    st.markdown("### 📊 Session")
     cost_info = orch.session_cost()
-    tokens    = cost_info["cumulative_tokens"]
-    st.metric("Total tokens used",  tokens.get("total", 0))
-    st.metric("Estimated cost",     f"${cost_info['cumulative_cost_usd']:.4f}")
-    st.metric("Runs this session",  len(st.session_state.results_history))
-
-    if st.button("🔄 Reset session stats"):
+    toks      = cost_info["cumulative_tokens"]
+    st.metric("Tokens",   toks.get("total",0))
+    st.metric("Est cost", f"${cost_info['cumulative_cost_usd']:.4f}")
+    st.metric("Runs",     len(st.session_state.history))
+    if st.button("🔄 Reset stats"):
         orch.llm.reset_cumulative_tokens()
-        st.session_state.results_history = []
+        st.session_state.history = []
         st.rerun()
 
-# ---------------------------------------------------------------------------
-# Main panel
-# ---------------------------------------------------------------------------
-st.title("🏗️ Data Engineering Agent Platform")
-st.caption(f"Environment: `{orch.cfg.environment}` · Model: `{orch.cfg.llm_config.get('model')}`")
 
-# Agent header
-col1, col2 = st.columns([1, 6])
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN PANEL — header
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.title("🏗️ Data Engineering Agent Platform")
+st.caption(f"Model: `{orch.cfg.llm_config.get('model')}` · Env: `{orch.cfg.environment}`")
+
+col1, col2 = st.columns([1,9])
 with col1:
-    st.markdown(f"<div style='font-size:3rem'>{chosen_meta['icon']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:2.5rem'>{chosen_meta['icon']}</div>", unsafe_allow_html=True)
 with col2:
     st.subheader(chosen_meta["display_name"])
     st.caption(chosen_meta["description"])
-    badge_color = "#1f77b4" if chosen_meta["type"] == "agentic" else "#2ca02c"
-    badge_label = "LLM-powered" if chosen_meta["type"] == "agentic" else "No LLM cost"
+    bc  = "#1a6fad" if chosen_meta["type"]=="agentic" else "#2a7a3b"
+    bl  = "LLM — uses tokens" if chosen_meta["type"]=="agentic" else "No LLM — free to run"
+    tgs = " ".join(f"`{t}`" for t in chosen_meta.get("tags",[]))
     st.markdown(
-        f"<span style='background:{badge_color};color:white;padding:2px 10px;"
-        f"border-radius:12px;font-size:0.75rem'>{badge_label}</span> &nbsp;"
-        + " ".join(f"`{t}`" for t in chosen_meta.get("tags", [])),
+        f"<span style='background:{bc};color:white;padding:2px 10px;border-radius:12px;font-size:0.75rem'>{bl}</span>&nbsp;&nbsp;{tgs}",
         unsafe_allow_html=True,
     )
 
 st.markdown("---")
 
-# ---------------------------------------------------------------------------
-# Input form
-# ---------------------------------------------------------------------------
-with st.form(key="agent_form"):
-    st.markdown("### ⚙️ Configure run")
+form_def = AGENT_FORMS.get(chosen_id, {})
+if msg := form_def.get("what_is_input"):
+    st.info(f"**What to provide:** {msg}", icon="ℹ️")
 
-    # --- Metadata input ---
-    st.markdown("#### Table metadata")
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 1 — TABLE WORKSPACE  (add tables from any source)
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.markdown("### Step 1 — Load tables")
+
+tab_catalog, tab_file, tab_json = st.tabs([
+    "🗄️  From catalog / metastore",
+    "📁  From file path (S3 / ADLS / GCS)",
+    "✏️  Paste JSON manually",
+])
+
+# ── Tab A: Catalog ────────────────────────────────────────────────────────────
+with tab_catalog:
     st.caption(
-        "Paste JSON metadata for one or more tables. "
-        "Raw data is automatically stripped — only schema info is sent to the LLM."
+        "Connect to any Unity Catalog or Hive metastore schema. "
+        "The platform queries INFORMATION_SCHEMA and computes column stats automatically."
     )
+    c1, c2 = st.columns([2,1])
+    with c1:
+        cat_schema = st.text_input(
+            "Catalog and schema",
+            placeholder="e.g. crm_prod.raw  or  hive_metastore.default",
+            help="Format: catalog.schema (Unity Catalog) or just schema (Hive metastore)",
+        )
+    with c2:
+        specific_tables = st.text_input(
+            "Specific tables (optional)",
+            placeholder="customer, orders, products",
+            help="Comma-separated. Leave blank to load ALL tables in the schema.",
+        )
 
-    default_meta = json.dumps([{
-        "table_name": "customer",
-        "database": "crm",
-        "row_count": 1200000,
-        "columns": [
-            {"name": "customer_id",   "data_type": "string",    "nullable": False,
-             "null_pct": 0.0, "distinct_count": 1200000, "sample_values": ["C001", "C002"]},
-            {"name": "first_name",    "data_type": "string",    "nullable": True,
-             "null_pct": 0.01, "distinct_count": 45000, "sample_values": ["Alice", "Bob"]},
-            {"name": "last_name",     "data_type": "string",    "nullable": True,
-             "null_pct": 0.01, "distinct_count": 80000, "sample_values": ["Smith", "Jones"]},
-            {"name": "email",         "data_type": "string",    "nullable": True,
-             "null_pct": 0.05, "distinct_count": 1150000, "sample_values": ["a@b.com"]},
-            {"name": "date_of_birth", "data_type": "date",      "nullable": True,
-             "null_pct": 0.08, "distinct_count": 25000},
-            {"name": "country_code",  "data_type": "string",    "nullable": False,
-             "null_pct": 0.0, "distinct_count": 45, "sample_values": ["GB", "US", "DE"]},
-            {"name": "created_at",    "data_type": "timestamp", "nullable": False,
-             "null_pct": 0.0, "distinct_count": 1200000},
-        ]
-    }], indent=2)
+    col_src, col_btn = st.columns([2,1])
+    with col_src:
+        rec_src_prefix = st.text_input(
+            "Record source prefix (optional)",
+            placeholder="e.g. salesforce or sap.erp",
+            help="Prepended to table name for the DV2 RECORD_SOURCE column.",
+        )
+    with col_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load_catalog_btn = st.button("Load from catalog", use_container_width=True)
 
-    metadata_input = st.text_area(
-        "Metadata JSON",
-        value=default_meta,
-        height=300,
-        help="Must be a JSON array of table metadata objects.",
+    if load_catalog_btn:
+        if not cat_schema.strip():
+            st.error("Please enter a catalog.schema value.")
+        else:
+            names = [t.strip() for t in specific_tables.split(",") if t.strip()] or None
+            with st.spinner(f"Extracting schema from {cat_schema}…"):
+                try:
+                    tables = extractor.from_catalog(cat_schema.strip(), names, rec_src_prefix.strip())
+                    tables = extractor.detect_relationships(tables)
+                    for t in tables:
+                        # Avoid duplicates
+                        existing = [x["table_name"] for x in st.session_state.loaded_tables]
+                        if t["table_name"] not in existing:
+                            st.session_state.loaded_tables.append(t)
+                    st.success(extractor.summary(tables))
+                except RuntimeError as e:
+                    st.error(str(e))
+
+# ── Tab B: File path ──────────────────────────────────────────────────────────
+with tab_file:
+    st.caption(
+        "Point at a cloud storage path. The platform reads a sample using Spark, "
+        "infers the schema, and computes column statistics."
     )
+    f1, f2, f3 = st.columns([3,1,1])
+    with f1:
+        file_path = st.text_input(
+            "Cloud file path",
+            placeholder="s3://my-bucket/data/customer/  or  abfss://raw@acct.dfs.core.windows.net/crm/",
+        )
+    with f2:
+        file_fmt = st.selectbox("Format", ["parquet","delta","csv","json","avro"])
+    with f3:
+        tbl_name_override = st.text_input("Table name override", placeholder="customer")
 
-    # --- Agent-specific options ---
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if chosen_id in ("data_model_gen",):
-            model_type = st.selectbox(
-                "Model type",
-                ["Data Vault 2.0 (silver layer)", "Dimensional model (gold layer)"]
+    fc1, fc2 = st.columns([2,1])
+    with fc1:
+        sample_size = st.number_input(
+            "Sample rows for stats",
+            min_value=100, max_value=100000, value=10000, step=1000,
+            help="Reads this many rows to compute null rates and distinct counts. Higher = more accurate but slower.",
+        )
+    with fc2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load_file_btn = st.button("Load from file", use_container_width=True)
+
+    if load_file_btn:
+        if not file_path.strip():
+            st.error("Please enter a file path.")
+        else:
+            with st.spinner(f"Reading {file_fmt} from {file_path}…"):
+                try:
+                    tables = extractor.from_file(
+                        path=file_path.strip(),
+                        file_format=file_fmt,
+                        sample_rows=int(sample_size),
+                        table_name=tbl_name_override.strip() or None,
+                    )
+                    tables = extractor.detect_relationships(
+                        st.session_state.loaded_tables + tables
+                    )
+                    for t in tables:
+                        existing = [x["table_name"] for x in st.session_state.loaded_tables]
+                        if t["table_name"] not in existing:
+                            st.session_state.loaded_tables.append(t)
+                    st.success(extractor.summary(tables[-1:]))
+                except (RuntimeError, ValueError) as e:
+                    st.error(str(e))
+
+# ── Tab C: Manual JSON ────────────────────────────────────────────────────────
+with tab_json:
+    st.caption(
+        "Paste metadata as JSON. Useful for tables from external systems or quick prototyping. "
+        "You can paste a single table or an array of tables."
+    )
+    manual_json = st.text_area(
+        "Table metadata JSON",
+        value=json.dumps([SAMPLE_TABLE], indent=2),
+        height=280,
+        help=(
+            "Required per table: table_name, columns (each needs name + data_type). "
+            "Optional but recommended: row_count, null_pct, distinct_count, sample_values."
+        ),
+    )
+    add_manual_btn = st.button("Add to table workspace", use_container_width=False)
+
+    if add_manual_btn:
+        try:
+            tables = extractor.from_manual(manual_json)
+            tables = extractor.detect_relationships(
+                st.session_state.loaded_tables + tables
             )
-        if chosen_id in ("sample_gen",):
-            num_rows = st.number_input("Number of sample rows", min_value=1, max_value=50, value=5)
-        if chosen_id in ("ingestion_cfg_gen",):
-            load_type = st.selectbox("Load type", ["incremental", "full", "streaming"])
+            for t in tables:
+                existing = [x["table_name"] for x in st.session_state.loaded_tables]
+                if t["table_name"] not in existing:
+                    st.session_state.loaded_tables.append(t)
+            st.success(extractor.summary(tables))
+        except ValueError as e:
+            st.error(f"Validation error: {e}")
 
-    with col_b:
-        use_cache = st.checkbox("Use prompt cache", value=True,
-                                help="Return cached result if same inputs were run before.")
+# ── Table workspace summary ───────────────────────────────────────────────────
+st.markdown("#### Table workspace")
 
-    # --- Free-text context ---
-    st.markdown("#### Additional context (optional)")
-    user_context = st.text_area(
-        "Any extra instructions, constraints, or domain context",
-        placeholder="e.g. 'Target is the silver layer. Use SHA-256 for hash keys. Source system is Salesforce.'",
-        height=100,
+if not st.session_state.loaded_tables:
+    st.warning("No tables loaded yet. Use one of the tabs above to add tables.")
+else:
+    for i, t in enumerate(st.session_state.loaded_tables):
+        col_info, col_remove = st.columns([10, 1])
+        with col_info:
+            mode_icon = {"catalog":"🗄️","file":"📁","manual":"✏️"}.get(t.get("source_mode","manual"),"📋")
+            rels = len(t.get("relationships",[]))
+            st.markdown(
+                f"{mode_icon} **{t['table_name']}** &nbsp;·&nbsp; "
+                f"{len(t['columns'])} cols &nbsp;·&nbsp; "
+                f"{t.get('row_count',0):,} rows &nbsp;·&nbsp; "
+                f"`{t.get('database','')}`"
+                + (f" &nbsp;·&nbsp; {rels} FK links detected" if rels else ""),
+                unsafe_allow_html=True,
+            )
+        with col_remove:
+            if st.button("✕", key=f"remove_{i}", help=f"Remove {t['table_name']}"):
+                st.session_state.loaded_tables.pop(i)
+                st.rerun()
+
+    if st.button("🗑️ Clear all tables"):
+        st.session_state.loaded_tables = []
+        st.rerun()
+
+    # Show detected relationships across all tables
+    all_rels = [
+        {"from_table": t["table_name"], **r}
+        for t in st.session_state.loaded_tables
+        for r in t.get("relationships",[])
+    ]
+    if all_rels:
+        with st.expander(f"🔗 {len(all_rels)} cross-table relationships detected"):
+            st.dataframe(all_rels, use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 2 — AGENT OPTIONS + RUN
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.markdown("### Step 2 — Configure and run")
+
+min_tables   = form_def.get("min_tables", 1)
+ready_to_run = len(st.session_state.loaded_tables) >= min_tables
+
+if not ready_to_run:
+    st.warning(
+        f"This agent needs at least **{min_tables} table(s)** in the workspace. "
+        f"You currently have {len(st.session_state.loaded_tables)}."
     )
 
-    submitted = st.form_submit_button("▶  Run agent", type="primary", use_container_width=True)
+extra_fields  = form_def.get("extra_fields", [])
+extra_values: dict = {}
 
-# ---------------------------------------------------------------------------
-# Execution
-# ---------------------------------------------------------------------------
-if submitted:
-    # Validate metadata JSON
-    try:
-        metadata = json.loads(metadata_input)
-        if isinstance(metadata, dict):
-            metadata = [metadata]
-    except json.JSONDecodeError as e:
-        st.error(f"❌ Invalid metadata JSON: {e}")
-        st.stop()
+with st.form(key=f"run_form_{chosen_id}"):
+
+    if extra_fields:
+        cols = st.columns(min(len(extra_fields), 2))
+        for i, field in enumerate(extra_fields):
+            with cols[i % 2]:
+                fk = field["key"]
+                fl = field["label"]
+                fh = field.get("help","")
+                if field["type"] == "selectbox":
+                    extra_values[fk] = st.selectbox(fl, field["options"], help=fh)
+                elif field["type"] == "multiselect":
+                    extra_values[fk] = st.multiselect(
+                        fl, field["options"],
+                        default=field.get("default", field["options"][:2]), help=fh,
+                    )
+                elif field["type"] == "number_input":
+                    extra_values[fk] = st.number_input(
+                        fl, min_value=field.get("min_value",0),
+                        max_value=field.get("max_value",100),
+                        value=field.get("default",5), help=fh,
+                    )
+                elif field["type"] == "text_input":
+                    extra_values[fk] = st.text_input(
+                        fl, placeholder=field.get("placeholder",""), help=fh,
+                    )
+                elif field["type"] == "text_area":
+                    extra_values[fk] = st.text_area(
+                        fl, placeholder=field.get("placeholder",""),
+                        height=field.get("height",80), help=fh,
+                    )
+
+    user_context = st.text_area(
+        "Additional context / instructions (optional)",
+        placeholder="e.g. Use SHA-256 hashing. Target catalog is prod_silver. Source system is Salesforce.",
+        height=70,
+    )
+
+    cache_col, run_col = st.columns([2,3])
+    with cache_col:
+        use_cache = st.checkbox("Use prompt cache", value=True,
+                                help="Skip LLM call and return cached result if identical inputs were run before.")
+    with run_col:
+        submitted = st.form_submit_button(
+            f"▶  Run {chosen_meta['display_name']}",
+            type="primary",
+            use_container_width=True,
+            disabled=not ready_to_run,
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EXECUTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+if submitted and ready_to_run:
+
+    # Build metadata list — always pass all loaded tables
+    metadata = st.session_state.loaded_tables
+
+    # Merge extra field values into dq_query_gen if existing rules provided
+    if chosen_id == "dq_query_gen" and extra_values.get("existing_rules_json","").strip():
+        try:
+            parsed_rules = json.loads(extra_values["existing_rules_json"])
+            for t in metadata:
+                t["existing_dq_rules"] = parsed_rules
+        except json.JSONDecodeError:
+            st.error("The 'Existing DQ rules JSON' field contains invalid JSON.")
+            st.stop()
 
     # Build context string
     context_parts = []
-    if user_context:
-        context_parts.append(user_context)
-    if chosen_id == "data_model_gen" and "model_type" in locals():
-        context_parts.append(f"Model type: {model_type}")
-    if chosen_id == "sample_gen" and "num_rows" in locals():
-        context_parts.append(str(num_rows))
-    if chosen_id == "ingestion_cfg_gen" and "load_type" in locals():
-        context_parts.append(f"Load type: {load_type}")
+    for field in extra_fields:
+        fk  = field["key"]
+        val = extra_values.get(fk)
+        if val and fk != "existing_rules_json":
+            context_parts.append(
+                f"{field['label']}: {', '.join(val) if isinstance(val,list) else val}"
+            )
+    if user_context.strip():
+        context_parts.append(user_context.strip())
     full_context = "\n".join(context_parts)
 
-    # Run
-    with st.spinner(f"Running {chosen_meta['display_name']}…"):
+    with st.spinner(f"Running {chosen_meta['display_name']} on {len(metadata)} table(s)…"):
         result = orch.run(
             agent_id=chosen_id,
             metadata=metadata,
@@ -213,174 +579,140 @@ if submitted:
             use_cache=use_cache,
         )
 
-    st.session_state.results_history.append(result)
+    st.session_state.history.append(result)
 
-    # Result display
     st.markdown("---")
     if result.status == "success":
+        cost = getattr(result,"cost_usd",None) or getattr(result,"cost_estimate_usd",0.0)
         st.success(
-            f"✅ Completed in {result.duration_seconds}s · "
-            f"{result.token_usage.get('total', 0)} tokens · "
-            f"est. cost ${result.cost_usd:.4f}",
+            f"✅ Done in {result.duration_seconds}s · "
+            f"{result.token_usage.get('total',0):,} tokens · est. ${cost:.4f}"
         )
-
-        st.markdown("### 📄 Output")
-
-        # Try to parse as JSON for pretty display
-        output = result.output
+        output      = result.output
         parsed_json = None
         if isinstance(output, str):
-            try:
-                parsed_json = json.loads(output)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        elif isinstance(output, dict):
+            try: parsed_json = json.loads(output)
+            except Exception: pass
+        elif isinstance(output, (dict,list)):
             parsed_json = output
 
-        tab_pretty, tab_raw, tab_download = st.tabs(["📋 Formatted", "🔤 Raw", "⬇️ Download"])
-
-        with tab_pretty:
-            if parsed_json:
-                _render_structured_output(chosen_id, parsed_json)
-            else:
-                st.markdown(output if isinstance(output, str) else str(output))
-
-        with tab_raw:
-            if parsed_json:
-                st.json(parsed_json)
-            else:
-                st.code(str(output), language="sql" if "sql" in chosen_id else "text")
-
-        with tab_download:
-            download_str = (
-                json.dumps(parsed_json, indent=2)
-                if parsed_json
-                else str(output)
-            )
-            st.download_button(
-                label="Download output as JSON",
-                data=download_str,
-                file_name=f"{result.run_id}.json",
-                mime="application/json",
-            )
+        t1, t2, t3 = st.tabs(["📋 Formatted","🔤 Raw JSON","⬇️ Download"])
+        with t1:
+            if parsed_json: _render_output(chosen_id, parsed_json)
+            else: st.markdown(str(output))
+        with t2:
+            if parsed_json: st.json(parsed_json)
+            else: st.code(str(output))
+        with t3:
+            dl = json.dumps(parsed_json,indent=2) if parsed_json else str(output)
+            st.download_button("Download JSON", data=dl,
+                               file_name=f"{result.run_id}.json", mime="application/json")
             st.caption(f"Run ID: `{result.run_id}`")
-            if result.output_path:
-                st.caption(f"Saved to: `{result.output_path}`")
-
     else:
-        st.error(f"❌ Agent run failed: {result.error}")
-        with st.expander("Error details"):
-            st.code(result.error)
+        st.error(f"❌ Failed: {result.error}")
+        with st.expander("Full error"): st.code(result.error)
 
-# ---------------------------------------------------------------------------
-# History panel
-# ---------------------------------------------------------------------------
-if st.session_state.results_history:
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HISTORY
+# ═════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.history:
     st.markdown("---")
-    with st.expander(f"📜 Run history ({len(st.session_state.results_history)} runs this session)"):
-        for r in reversed(st.session_state.results_history[-10:]):
-            status_icon = "✅" if r.status == "success" else "❌"
+    with st.expander(f"📜 Run history ({len(st.session_state.history)} runs)"):
+        for r in reversed(st.session_state.history[-10:]):
+            icon = "✅" if r.status=="success" else "❌"
+            cost = getattr(r,"cost_usd",None) or getattr(r,"cost_estimate_usd",0.0)
             st.markdown(
-                f"{status_icon} **{r.agent_id}** · `{r.run_id}` · "
-                f"{r.duration_seconds}s · {r.token_usage.get('total', 0)} tokens"
+                f"{icon} **{r.agent_id}** · `{r.run_id}` · "
+                f"{r.duration_seconds}s · {r.token_usage.get('total',0):,} tokens · ${cost:.4f}"
             )
 
 
-# ---------------------------------------------------------------------------
-# Structured output renderer
-# ---------------------------------------------------------------------------
-def _render_structured_output(agent_id: str, data: dict) -> None:
-    """Render agent-specific structured JSON output nicely in Streamlit."""
+# ═════════════════════════════════════════════════════════════════════════════
+# OUTPUT RENDERERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _render_output(agent_id: str, data):
+    if isinstance(data, list): data = data[0] if data else {}
 
     if agent_id == "data_model_gen":
-        entities = data.get("entities", [])
-        st.markdown(f"**Model type:** `{data.get('model_type', 'N/A')}` · "
-                    f"**Target layer:** `{data.get('target_layer', 'N/A')}` · "
-                    f"**Entities:** {len(entities)}")
-        for entity in entities:
-            with st.expander(f"{entity.get('entity_type', '').upper()} — `{entity.get('table_name')}`"):
-                st.caption(entity.get("description", ""))
-                cols = entity.get("columns", [])
-                if cols:
-                    st.dataframe(cols, use_container_width=True)
-                st.markdown(f"**Load strategy:** `{entity.get('load_strategy', 'N/A')}`")
-        if notes := data.get("notes"):
-            st.info(f"📝 {notes}")
+        entities = data.get("entities",[])
+        st.markdown(f"**{data.get('model_type','?')}** · Layer: `{data.get('target_layer','?')}` · {len(entities)} entities")
+        for e in entities:
+            with st.expander(f"{e.get('entity_type','').upper()} — `{e.get('table_name')}`"):
+                st.caption(e.get("description",""))
+                if cols := e.get("columns",[]): st.dataframe(cols, use_container_width=True)
+                if fks := e.get("foreign_keys",[]): st.markdown("**FKs:** " + " · ".join(f"`{f['column']}` → `{f['references']}`" for f in fks))
+                st.markdown(f"**Load:** `{e.get('load_strategy','?')}`")
+        if rels := data.get("relationships",[]): st.dataframe(rels, use_container_width=True)
+        if notes := data.get("notes"): st.info(f"📝 {notes}")
 
-    elif agent_id == "test_case_gen":
-        cases = data.get("test_cases", [])
-        st.markdown(f"**{data.get('test_suite', '')}** · {len(cases)} test cases")
-        p1 = [c for c in cases if c.get("priority") == "P1"]
-        p2 = [c for c in cases if c.get("priority") == "P2"]
-        p3 = [c for c in cases if c.get("priority") == "P3"]
-        for priority, group in [("🔴 P1 — Critical", p1), ("🟠 P2 — High", p2), ("🟡 P3 — Medium", p3)]:
+    elif agent_id in ("test_case_gen",):
+        cases = data.get("test_cases",[])
+        st.markdown(f"**{data.get('test_suite','')}** — {len(cases)} test cases")
+        for pri,label,colour in [("P1","Critical","🔴"),("P2","High","🟠"),("P3","Medium","🟡")]:
+            group = [c for c in cases if c.get("priority")==pri]
             if group:
-                st.markdown(f"**{priority}**")
+                st.markdown(f"**{colour} {pri} — {label} ({len(group)})**")
                 for tc in group:
                     with st.expander(f"`{tc.get('test_id')}` {tc.get('description')}"):
-                        st.markdown(f"**Category:** `{tc.get('category')}`")
-                        st.markdown(f"**Input condition:** {tc.get('input_condition')}")
-                        st.markdown(f"**Expected result:** {tc.get('expected_result')}")
-                        if sql := tc.get("validation_sql"):
-                            st.code(sql, language="sql")
+                        st.markdown(f"**Category:** `{tc.get('category')}`  **Input:** {tc.get('input_condition')}")
+                        st.markdown(f"**Expected:** {tc.get('expected_result')}")
+                        if sql := tc.get("validation_sql"): st.code(sql, language="sql")
+
+    elif agent_id in ("test_query_gen","dq_query_gen"):
+        qs = data.get("queries",[])
+        st.markdown(f"{len(qs)} queries generated")
+        for q in qs:
+            pri = q.get("priority","P3")
+            col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
+            lid = q.get("query_id") or q.get("rule_id","")
+            desc = q.get("test_description") or q.get("monitoring_label","")
+            with st.expander(f"{col} `{lid}` · {desc}"):
+                st.markdown(f"**Pass when:** {q.get('pass_condition','')}")
+                st.code(q.get("sql",""), language="sql")
 
     elif agent_id == "dq_recommender":
-        rules = data.get("dq_rules", [])
-        st.markdown(f"**Table:** `{data.get('table_name')}` · {len(rules)} DQ rules")
-        for rule in rules:
-            pri = rule.get("priority", "P4")
-            colour = {"P1": "🔴", "P2": "🟠", "P3": "🟡", "P4": "⚪"}.get(pri, "⚪")
-            with st.expander(f"{colour} `{rule.get('rule_id')}` — {rule.get('rule_type')} on `{rule.get('column', 'table')}`"):
-                st.markdown(f"**Description:** {rule.get('description')}")
-                st.markdown(f"**Threshold:** `{rule.get('threshold')}`")
-                st.markdown(f"**Pass condition:** {rule.get('pass_condition')}")
-                if sql := rule.get("sql_template"):
-                    st.code(sql, language="sql")
+        rules = data.get("dq_rules",[])
+        st.markdown(f"**{data.get('table_name','')}** — {len(rules)} rules recommended")
+        for rule in sorted(rules, key=lambda r: {"P1":0,"P2":1,"P3":2,"P4":3}.get(r.get("priority","P4"),4)):
+            pri = rule.get("priority","P4")
+            col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
+            target = f"`{rule.get('column')}`" if rule.get("column") else "table-level"
+            with st.expander(f"{col} `{rule.get('rule_id')}` · {rule.get('rule_type')} on {target}"):
+                st.markdown(f"**{rule.get('description')}**  Threshold: `{rule.get('threshold')}`")
+                if sql := rule.get("sql_template"): st.code(sql, language="sql")
 
     elif agent_id == "lineage_creator":
-        graph = data.get("lineage_graph", {})
-        nodes = graph.get("nodes", [])
-        edges = graph.get("edges", [])
-        st.markdown(f"**Nodes:** {len(nodes)} · **Edges:** {len(edges)}")
-        st.markdown(f"*{data.get('summary', '')}*")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Nodes**")
-            st.dataframe(nodes, use_container_width=True)
-        with col2:
-            st.markdown("**Edges (transformations)**")
-            st.dataframe(edges, use_container_width=True)
+        graph = data.get("lineage_graph",{})
+        nodes, edges = graph.get("nodes",[]), graph.get("edges",[])
+        st.markdown(f"*{data.get('summary','')}*")
+        c1,c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**{len(nodes)} Nodes**"); st.dataframe(nodes, use_container_width=True)
+        with c2:
+            st.markdown(f"**{len(edges)} Edges**"); st.dataframe(edges, use_container_width=True)
 
     elif agent_id == "sttm_gen":
-        sttm = data.get("sttm", {})
-        st.markdown(f"**{sttm.get('document_title', 'STTM')}** · v{sttm.get('version', '1.0')}")
-        st.markdown(f"**Source:** `{sttm.get('source_table')}` → **Target:** `{sttm.get('target_table')}`")
-        st.markdown(f"**Load type:** `{sttm.get('load_type')}`")
-        mappings = sttm.get("column_mappings", [])
-        if mappings:
-            st.markdown(f"**{len(mappings)} column mappings**")
-            st.dataframe(mappings, use_container_width=True)
-        if questions := sttm.get("open_questions"):
-            st.warning("Open questions:\n" + "\n".join(f"- {q}" for q in questions))
+        sttm = data.get("sttm", data)
+        st.markdown(f"**{sttm.get('document_title','STTM')}** · `{sttm.get('source_table')}` → `{sttm.get('target_table')}`")
+        if mappings := sttm.get("column_mappings",[]): st.dataframe(mappings, use_container_width=True)
+        if qs := sttm.get("open_questions",[]): st.warning("\n".join(f"- {q}" for q in qs))
 
-    elif agent_id in ("data_profiler",):
-        profiles = data.get("profiles", [])
-        for p in profiles:
-            st.markdown(f"**{p.get('table_name')}** — {p.get('row_count')} rows, {p.get('column_count')} columns")
-            st.dataframe(p.get("columns", []), use_container_width=True)
+    elif agent_id == "data_profiler":
+        for p in data.get("profiles",[]):
+            st.markdown(f"**{p.get('table_name')}** — {p.get('row_count',0):,} rows · {p.get('column_count',0)} cols")
+            st.dataframe(p.get("columns",[]), use_container_width=True)
 
     elif agent_id == "sample_gen":
-        samples = data.get("samples", [])
-        for s in samples:
-            st.markdown(f"**{s.get('table_name')}** — {s.get('row_count')} sample rows")
-            st.dataframe(s.get("rows", []), use_container_width=True)
+        for s in data.get("samples",[]):
+            st.markdown(f"**{s.get('table_name')}** — {s.get('row_count')} rows")
+            st.dataframe(s.get("rows",[]), use_container_width=True)
 
     elif agent_id == "ingestion_cfg_gen":
-        configs = data.get("ingestion_configs", [])
-        for cfg in configs:
-            with st.expander(f"Config: `{cfg.get('source_table')}` → `{cfg.get('target_table')}`"):
-                st.json(cfg)
-
+        for cfg_item in data.get("ingestion_configs",[]):
+            with st.expander(f"`{cfg_item.get('source_table')}` → `{cfg_item.get('target_table')}`"):
+                st.json(cfg_item)
     else:
-        # Generic fallback
         st.json(data)
