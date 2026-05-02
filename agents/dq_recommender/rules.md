@@ -1,23 +1,37 @@
-# DQ Recommender — Rules
+# DQ Recommender — Governance Rules
 
-## Always Recommend (P1)
-- NOT_NULL on all primary key and hash key columns.
-- UNIQUE on all business key and hash key columns.
-- REFERENTIAL_INTEGRITY on all foreign key / hash key reference columns.
+## CRITICAL — SQL Must Use Real Table Names
+- Every SQL statement MUST use the exact fully qualified table name from the metadata.
+- The format is: `database.table_name` — e.g. `samples.wanderbricks.bookings`
+- NEVER write `{table}`, `<table>`, `{column}`, `<column_name>`, `your_table`, or ANY placeholder.
+- SQL must be immediately runnable with no substitution needed.
+- Return 0 when the rule passes, a positive integer when it fails.
 
-## Recommend Where Applicable (P2)
-- FRESHNESS_CHECK on load_date columns (threshold: 25 hours).
-- ROW_COUNT_THRESHOLD for tables expected to have > 0 rows.
-- COMPLETENESS_RATIO > 95% for columns where NULL percentage is expected to be low.
+## Always Recommend (P1 — Critical)
+- NOT_NULL on every non-nullable column and every primary/foreign key.
+  Correct SQL: `SELECT COUNT(*) FROM samples.wanderbricks.bookings WHERE booking_id IS NULL`
+- UNIQUE on every business key and primary key.
+  Correct SQL: `SELECT COUNT(*) - COUNT(DISTINCT booking_id) FROM samples.wanderbricks.bookings`
+- ROW_COUNT > 0 for every table.
+  Correct SQL: `SELECT CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END FROM samples.wanderbricks.bookings`
 
-## Recommend Based on Data Type (P3/P4)
-- REGEX for columns named email, phone, postal_code, country_code.
-- RANGE_CHECK for numeric columns where sample values imply a bounded domain.
-- ENUM_CHECK for columns with very low distinct count (< 20 distinct values).
-- LENGTH_CHECK for string columns where sample values show consistent length.
+## Recommend Where Applicable (P2 — High)
+- FRESHNESS on columns named load_date, created_at, updated_at, event_time.
+  Correct SQL: `SELECT CASE WHEN MAX(created_at) < CURRENT_TIMESTAMP - INTERVAL 25 HOURS THEN 1 ELSE 0 END FROM samples.wanderbricks.bookings`
+- COMPLETENESS where null_pct is between 0.01 and 0.20.
+  Correct SQL: `SELECT SUM(CASE WHEN email IS NULL THEN 1 ELSE 0 END) FROM samples.wanderbricks.users`
 
-## Anti-Patterns
-- Do NOT recommend both NOT_NULL and COMPLETENESS_RATIO on the same column.
-- Do NOT recommend UNIQUE on columns with many-to-one relationships.
-- Do NOT recommend RANGE_CHECK on string or date columns.
-- Limit rules to 15 maximum per table — prioritise P1 and P2.
+## Recommend Based on Column Characteristics (P3/P4)
+- REGEX on columns named email, phone, postal_code, country_code.
+  Correct SQL: `SELECT COUNT(*) FROM samples.wanderbricks.users WHERE email NOT RLIKE '^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$'`
+- RANGE_CHECK on numeric columns with bounded sample values.
+  Correct SQL: `SELECT COUNT(*) FROM samples.wanderbricks.bookings WHERE total_price < 0 OR total_price > 100000`
+- ENUM_CHECK on string columns with distinct_count < 20.
+  Correct SQL: `SELECT COUNT(*) FROM samples.wanderbricks.bookings WHERE status NOT IN ('confirmed','pending','cancelled')`
+
+## Anti-Patterns — Never Do These
+- NEVER use {table}, <table>, {column}, <column_name>, or any other placeholder in SQL.
+- Do NOT recommend both NOT_NULL and COMPLETENESS on the same column.
+- Do NOT recommend UNIQUE on foreign key columns (they are many-to-one by design).
+- Do NOT recommend RANGE_CHECK on string or timestamp columns.
+- Maximum 12 rules per table. Drop P4 first, then P3 if still over the limit.
