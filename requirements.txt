@@ -1,12 +1,3 @@
-# agent_platform/requirements.txt
-# Install on Databricks cluster init script:
-#   %pip install -r /Workspace/Repos/<repo>/agent_platform/requirements.txt
-
 pyyaml>=6.0
 databricks-sdk>=0.20.0
-
-# Streamlit UI (installed on Databricks Apps or locally)
 streamlit>=1.35.0
-
-# Optional: for local dev without Databricks
-# faker>=25.0.0   # richer sample data generation
