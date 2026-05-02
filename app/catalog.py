@@ -33,10 +33,12 @@ st.set_page_config(
 # ── session state ─────────────────────────────────────────────────────────────
 def _init_state():
     defaults = {
-        "orchestrator": Orchestrator(base_dir=ROOT),
-        "extractor":    MetadataExtractor(),
-        "history":      [],
-        "loaded_tables":[],      # list of metadata dicts built up by the user
+        "orchestrator":   Orchestrator(base_dir=ROOT),
+        "extractor":      MetadataExtractor(),
+        "history":        [],
+        "loaded_tables":  [],   # list of metadata dicts built up by the user
+        "last_agent_id":  None, # tracks agent switches — clears workspace on change
+        "last_result":    None, # most recent AgentResult — shown after run
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -282,6 +284,12 @@ with col2:
     )
 
 st.markdown("---")
+
+# ── Auto-clear workspace and last result when agent changes ──────────────────
+if st.session_state.last_agent_id != chosen_id:
+    st.session_state.loaded_tables = []
+    st.session_state.last_result   = None
+    st.session_state.last_agent_id = chosen_id
 
 form_def = AGENT_FORMS.get(chosen_id, {})
 if msg := form_def.get("what_is_input"):
@@ -658,15 +666,36 @@ if submitted and ready_to_run:
         context_parts.append(user_context.strip())
     full_context = "\n".join(context_parts)
 
-    with st.spinner(f"Running {chosen_meta['display_name']} on {len(metadata)} table(s)…"):
-        result = orch.run(
-            agent_id=chosen_id,
-            metadata=metadata,
-            user_context=full_context,
-            use_cache=use_cache,
-        )
+    # ── Run with live log display ─────────────────────────────────────────
+    n_tables  = len(metadata)
+    total_cols = sum(len(t.get("columns", [])) for t in metadata)
+    log_placeholder = st.empty()
+    log_placeholder.info(
+        f"⏳ Running **{chosen_meta['display_name']}** on "
+        f"{n_tables} table(s) · {total_cols} columns…  "
+        f"_This may take 30–120s for large schemas._"
+    )
+
+    result = orch.run(
+        agent_id=chosen_id,
+        metadata=metadata,
+        user_context=full_context,
+        use_cache=use_cache,
+    )
+
+    # Replace the waiting message with the run log
+    log_entries = getattr(result, "log_entries", [])
+    if log_entries:
+        log_lines = []
+        for e in log_entries:
+            icon = {"done":"🟢","error":"🔴","warn":"🟡","info":"⬜"}.get(e.level, "⬜")
+            log_lines.append(f"`{e.timestamp}` {icon} {e.message}")
+        log_placeholder.markdown("**Run log:**\n\n" + "\n\n".join(log_lines))
+    else:
+        log_placeholder.empty()
 
     st.session_state.history.append(result)
+    st.session_state.last_result = result
 
     st.markdown("---")
     if result.status == "success":
@@ -677,24 +706,64 @@ if submitted and ready_to_run:
         )
         output      = result.output
         parsed_json = None
-        if isinstance(output, str):
-            try: parsed_json = json.loads(output)
-            except Exception: pass
-        elif isinstance(output, (dict,list)):
+        if isinstance(output, (dict, list)):
             parsed_json = output
+        elif isinstance(output, str):
+            # Strip markdown code fences the LLM sometimes wraps around JSON
+            cleaned = output.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1]  # drop ```json line
+                cleaned = cleaned.rsplit("```", 1)[0]  # drop trailing ```
+                cleaned = cleaned.strip()
+            try:
+                parsed_json = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
-        t1, t2, t3 = st.tabs(["📋 Formatted","🔤 Raw JSON","⬇️ Download"])
+        t1, t2, t3, t4 = st.tabs(["📋 Formatted", "📊 Table / CSV", "🔤 Raw JSON", "⬇️ Download"])
         with t1:
             if parsed_json: _render_output(chosen_id, parsed_json)
             else: st.markdown(str(output))
         with t2:
+            if parsed_json:
+                import pandas as pd
+                df = _to_dataframe(chosen_id, parsed_json)
+                if df is not None and not df.empty:
+                    st.dataframe(df, use_container_width=True)
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download as CSV",
+                        data=csv_bytes,
+                        file_name=f"{result.run_id}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No flat tabular representation available for this output.")
+            else:
+                st.info("Output is not structured JSON — no table view available.")
+        with t3:
             if parsed_json: st.json(parsed_json)
             else: st.code(str(output))
-        with t3:
-            dl = json.dumps(parsed_json,indent=2) if parsed_json else str(output)
-            st.download_button("Download JSON", data=dl,
-                               file_name=f"{result.run_id}.json", mime="application/json")
+        with t4:
+            col_j, col_c = st.columns(2)
+            with col_j:
+                dl = json.dumps(parsed_json,indent=2) if parsed_json else str(output)
+                st.download_button("⬇️ Download JSON", data=dl,
+                                   file_name=f"{result.run_id}.json", mime="application/json",
+                                   use_container_width=True)
+            with col_c:
+                if parsed_json:
+                    import pandas as pd
+                    df2 = _to_dataframe(chosen_id, parsed_json)
+                    if df2 is not None and not df2.empty:
+                        st.download_button("⬇️ Download CSV",
+                                           data=df2.to_csv(index=False).encode("utf-8"),
+                                           file_name=f"{result.run_id}.csv", mime="text/csv",
+                                           use_container_width=True)
             st.caption(f"Run ID: `{result.run_id}`")
+            if getattr(result, "output_path", None):
+                st.caption(f"Saved to: `{result.output_path}`")
     else:
         st.error(f"❌ Failed: {result.error}")
         with st.expander("Full error"): st.code(result.error)
@@ -719,6 +788,225 @@ if st.session_state.history:
 # ═════════════════════════════════════════════════════════════════════════════
 # OUTPUT RENDERERS
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TABULAR FLATTENER — converts agent JSON output to a pandas DataFrame for CSV
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _to_dataframe(agent_id: str, data):
+    """Flatten agent JSON output into a pandas DataFrame. Returns None if not possible."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+
+    try:
+        if isinstance(data, list):
+            data = data[0] if data else {}
+
+        if agent_id == "data_model_gen":
+            rows = []
+            for e in data.get("entities", []):
+                for col in e.get("columns", []):
+                    rows.append({
+                        "entity_type":   e.get("entity_type"),
+                        "table_name":    e.get("table_name"),
+                        "load_strategy": e.get("load_strategy"),
+                        "column_name":   col.get("name"),
+                        "data_type":     col.get("data_type"),
+                        "nullable":      col.get("nullable"),
+                        "description":   col.get("description",""),
+                    })
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "test_case_gen":
+            rows = data.get("test_cases", [])
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "test_query_gen":
+            rows = data.get("queries", [])
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "dq_recommender":
+            # handles single table {"dq_rules":[...]} and multi {"tables":[...]}
+            if "tables" in data:
+                rows = []
+                for t in data["tables"]:
+                    for r in t.get("dq_rules", []):
+                        rows.append({"table_name": t.get("table_name"), **r})
+            else:
+                rows = [{"table_name": data.get("table_name",
+                                                 data.get("fully_qualified_name","")), **r}
+                        for r in data.get("dq_rules", [])]
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "dq_query_gen":
+            rows = data.get("queries", [])
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "lineage_creator":
+            graph = data.get("lineage_graph", {})
+            edges = graph.get("edges", [])
+            nodes = graph.get("nodes", [])
+            # Prefer edges as primary CSV (more informative); fall back to nodes
+            return pd.DataFrame(edges) if edges else (pd.DataFrame(nodes) if nodes else None)
+
+        elif agent_id == "sttm_gen":
+            sttm = data.get("sttm", data)
+            rows = sttm.get("column_mappings", [])
+            if rows:
+                df = pd.DataFrame(rows)
+                df.insert(0, "source_table", sttm.get("source_table", ""))
+                df.insert(1, "target_table",  sttm.get("target_table", ""))
+                return df
+            return None
+
+        elif agent_id == "data_profiler":
+            rows = []
+            for p in data.get("profiles", []):
+                for col in p.get("columns", []):
+                    rows.append({"table_name": p.get("table_name"), **col})
+            return pd.DataFrame(rows) if rows else None
+
+        elif agent_id == "sample_gen":
+            frames = []
+            for s in data.get("samples", []):
+                df = pd.DataFrame(s.get("rows", []))
+                if not df.empty:
+                    df.insert(0, "table_name", s.get("table_name", ""))
+                frames.append(df)
+            import pandas as _pd
+            return _pd.concat(frames, ignore_index=True) if frames else None
+
+        elif agent_id == "ingestion_cfg_gen":
+            rows = []
+            for cfg in data.get("ingestion_configs", []):
+                rows.append({
+                    "source_table":  cfg.get("source_table"),
+                    "target_table":  cfg.get("target_table"),
+                    "format":        cfg.get("format"),
+                    "load_type":     cfg.get("load_type"),
+                    "checkpoint":    (cfg.get("autoloader") or {}).get("checkpointLocation",""),
+                    "schema_loc":    (cfg.get("autoloader") or {}).get("schemaLocation",""),
+                    "columns":       ", ".join(cfg.get("selected_columns", [])),
+                })
+            return pd.DataFrame(rows) if rows else None
+
+        else:
+            # Generic: if top-level value is a list of flat dicts, use directly
+            for v in data.values() if isinstance(data, dict) else []:
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    return pd.DataFrame(v)
+            return None
+
+    except Exception as e:
+        return None
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CSV HELPER — flatten each agent output to a pandas DataFrame
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _to_dataframe(agent_id: str, data):
+    """Convert structured agent JSON output to a flat pandas DataFrame."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+    try:
+        if isinstance(data, list):
+            data = data[0] if data else {}
+
+        if agent_id == "data_model_gen":
+            rows = []
+            for e in data.get("entities", []):
+                for col in e.get("columns", []):
+                    rows.append({
+                        "entity_type": e.get("entity_type"),
+                        "table_name":  e.get("table_name"),
+                        "load_strategy": e.get("load_strategy"),
+                        "column_name": col.get("name"),
+                        "data_type":   col.get("data_type"),
+                        "nullable":    col.get("nullable"),
+                        "description": col.get("description"),
+                    })
+            return pd.DataFrame(rows) if rows else None
+
+        if agent_id == "test_case_gen":
+            return pd.DataFrame(data.get("test_cases", [])) or None
+
+        if agent_id == "test_query_gen":
+            return pd.DataFrame(data.get("queries", [])) or None
+
+        if agent_id == "dq_recommender":
+            rows = []
+            for tbl in (data.get("tables") if "tables" in data else [data]):
+                for r in tbl.get("dq_rules", []):
+                    rows.append({
+                        "table_name": tbl.get("table_name"),
+                        "fully_qualified_name": tbl.get("fully_qualified_name"),
+                        **r
+                    })
+            return pd.DataFrame(rows) if rows else None
+
+        if agent_id == "dq_query_gen":
+            return pd.DataFrame(data.get("queries", [])) or None
+
+        if agent_id == "lineage_creator":
+            graph = data.get("lineage_graph", {})
+            edges = pd.DataFrame(graph.get("edges", []))
+            return edges if not edges.empty else pd.DataFrame(graph.get("nodes", [])) or None
+
+        if agent_id == "sttm_gen":
+            sttm = data.get("sttm", data)
+            rows = sttm.get("column_mappings", [])
+            if rows:
+                df = pd.DataFrame(rows)
+                df.insert(0, "source_table", sttm.get("source_table", ""))
+                df.insert(1, "target_table",  sttm.get("target_table", ""))
+                return df
+            return None
+
+        if agent_id == "data_profiler":
+            rows = []
+            for p in data.get("profiles", []):
+                for col in p.get("columns", []):
+                    rows.append({"table_name": p.get("table_name"), **col})
+            return pd.DataFrame(rows) if rows else None
+
+        if agent_id == "sample_gen":
+            frames = []
+            for s in data.get("samples", []):
+                df = pd.DataFrame(s.get("rows", []))
+                if not df.empty:
+                    df.insert(0, "table_name", s.get("table_name", ""))
+                    frames.append(df)
+            return pd.concat(frames, ignore_index=True) if frames else None
+
+        if agent_id == "ingestion_cfg_gen":
+            rows = []
+            for cfg in data.get("ingestion_configs", []):
+                rows.append({
+                    "source_table": cfg.get("source_table"),
+                    "target_table": cfg.get("target_table"),
+                    "format":       cfg.get("format"),
+                    "load_type":    cfg.get("load_type"),
+                    "checkpoint":   cfg.get("autoloader", {}).get("checkpointLocation"),
+                    "schema_loc":   cfg.get("autoloader", {}).get("schemaLocation"),
+                    "columns":      ", ".join(cfg.get("selected_columns", [])),
+                })
+            return pd.DataFrame(rows) if rows else None
+
+        # Generic fallback
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return pd.DataFrame(data)
+        return None
+
+    except Exception:
+        return None
+
 
 def _render_output(agent_id: str, data):
     if isinstance(data, list): data = data[0] if data else {}
@@ -761,15 +1049,22 @@ def _render_output(agent_id: str, data):
                 st.code(q.get("sql",""), language="sql")
 
     elif agent_id == "dq_recommender":
-        rules = data.get("dq_rules",[])
-        st.markdown(f"**{data.get('table_name','')}** — {len(rules)} rules recommended")
-        for rule in sorted(rules, key=lambda r: {"P1":0,"P2":1,"P3":2,"P4":3}.get(r.get("priority","P4"),4)):
-            pri = rule.get("priority","P4")
-            col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
-            target = f"`{rule.get('column')}`" if rule.get("column") else "table-level"
-            with st.expander(f"{col} `{rule.get('rule_id')}` · {rule.get('rule_type')} on {target}"):
-                st.markdown(f"**{rule.get('description')}**  Threshold: `{rule.get('threshold')}`")
-                if sql := rule.get("sql_template"): st.code(sql, language="sql")
+        # Handle single-table {"dq_rules":[...]} and multi-table {"tables":[...]}
+        table_list = data.get("tables") if "tables" in data else [data]
+        for tbl in table_list:
+            rules = tbl.get("dq_rules", [])
+            fqn   = tbl.get("fully_qualified_name") or tbl.get("table_name", "")
+            st.markdown(f"**{fqn}** — {len(rules)} DQ rules")
+            for rule in sorted(rules, key=lambda r: {"P1":0,"P2":1,"P3":2,"P4":3}.get(r.get("priority","P4"),4)):
+                pri = rule.get("priority","P4")
+                col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
+                target = f"`{rule.get('column')}`" if rule.get("column") else "table-level"
+                with st.expander(f"{col} `{rule.get('rule_id')}` · {rule.get('rule_type')} on {target}"):
+                    st.markdown(f"**{rule.get('description')}**  Threshold: `{rule.get('threshold')}`")
+                    st.markdown(f"Pass when: {rule.get('pass_condition', '')}")
+                    sql_text = rule.get("sql") or rule.get("sql_template") or ""
+                    if sql_text:
+                        st.code(sql_text, language="sql")
 
     elif agent_id == "lineage_creator":
         graph = data.get("lineage_graph",{})
