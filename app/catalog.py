@@ -1,10 +1,10 @@
 """
-app/catalog.py — Agent Catalog UI v3
+app/catalog.py - Agent Catalog UI v3
 
 Three input modes per agent:
-  A. Unity Catalog / Hive metastore  — type catalog.schema, pick tables
-  B. Cloud file path                  — paste S3/ADLS/GCS path
-  C. Manual JSON                      — paste or edit metadata directly
+  A. Unity Catalog / Hive metastore  - type catalog.schema, pick tables
+  B. Cloud file path                  - paste S3/ADLS/GCS path
+  C. Manual JSON                      - paste or edit metadata directly
 
 Multi-table workspace: users build up a list of tables across sessions
 before running an agent. Relationship detection runs automatically.
@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from core.orchestrator        import Orchestrator
 from core.metadata_extractor  import MetadataExtractor, _spark_available
 
-# ── page config ───────────────────────────────────────────────────────────────
+# -- page config ---------------------------------------------------------------
 st.set_page_config(
     page_title="DE Agent Platform",
     page_icon="🤖",
@@ -30,11 +30,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── session state ─────────────────────────────────────────────────────────────
+# -- session state -------------------------------------------------------------
 
-# ═════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS — defined before any UI code so they are always available
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# HELPER FUNCTIONS - defined before any UI code so they are always available
+# =============================================================================
 
 def _to_dataframe(agent_id: str, data):
     """Convert structured agent JSON output to a flat pandas DataFrame."""
@@ -144,7 +144,7 @@ def _render_output(agent_id: str, data):
         entities = data.get("entities",[])
         st.markdown(f"**{data.get('model_type','?')}** · Layer: `{data.get('target_layer','?')}` · {len(entities)} entities")
         for e in entities:
-            with st.expander(f"{e.get('entity_type','').upper()} — `{e.get('table_name')}`"):
+            with st.expander(f"{e.get('entity_type','').upper()} - `{e.get('table_name')}`"):
                 st.caption(e.get("description",""))
                 if cols := e.get("columns",[]): st.dataframe(cols, use_container_width=True)
                 if fks := e.get("foreign_keys",[]): st.markdown("**FKs:** " + " · ".join(f"`{f['column']}` → `{f['references']}`" for f in fks))
@@ -154,11 +154,11 @@ def _render_output(agent_id: str, data):
 
     elif agent_id in ("test_case_gen",):
         cases = data.get("test_cases",[])
-        st.markdown(f"**{data.get('test_suite','')}** — {len(cases)} test cases")
+        st.markdown(f"**{data.get('test_suite','')}** - {len(cases)} test cases")
         for pri,label,colour in [("P1","Critical","🔴"),("P2","High","🟠"),("P3","Medium","🟡")]:
             group = [c for c in cases if c.get("priority")==pri]
             if group:
-                st.markdown(f"**{colour} {pri} — {label} ({len(group)})**")
+                st.markdown(f"**{colour} {pri} - {label} ({len(group)})**")
                 for tc in group:
                     with st.expander(f"`{tc.get('test_id')}` {tc.get('description')}"):
                         st.markdown(f"**Category:** `{tc.get('category')}`  **Input:** {tc.get('input_condition')}")
@@ -183,7 +183,7 @@ def _render_output(agent_id: str, data):
         for tbl in table_list:
             rules = tbl.get("dq_rules", [])
             fqn   = tbl.get("fully_qualified_name") or tbl.get("table_name", "")
-            st.markdown(f"**{fqn}** — {len(rules)} DQ rules")
+            st.markdown(f"**{fqn}** - {len(rules)} DQ rules")
             for rule in sorted(rules, key=lambda r: {"P1":0,"P2":1,"P3":2,"P4":3}.get(r.get("priority","P4"),4)):
                 pri = rule.get("priority","P4")
                 col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
@@ -212,19 +212,67 @@ def _render_output(agent_id: str, data):
         if qs := sttm.get("open_questions",[]): st.warning("\n".join(f"- {q}" for q in qs))
 
     elif agent_id == "data_profiler":
-        for p in data.get("profiles",[]):
-            st.markdown(f"**{p.get('table_name')}** — {p.get('row_count',0):,} rows · {p.get('column_count',0)} cols")
-            st.dataframe(p.get("columns",[]), use_container_width=True)
+        for p in data.get("profiles", []):
+            fqn  = p.get("fully_qualified_name") or p.get("table_name", "?")
+            note = p.get("stats_note", "")
+            st.markdown(f"**{fqn}** — {p.get('row_count',0):,} rows · {p.get('column_count',0)} cols")
+            if note:
+                if "empty" in note.lower() or "no row" in note.lower():
+                    st.warning(f"ℹ️ {note}")
+                else:
+                    st.caption(note)
+            cols_data = p.get("columns", [])
+            if cols_data:
+                import pandas as pd
+                df = pd.DataFrame(cols_data)
+                show_cols = [c for c in df.columns if c not in ("stats_source", "likely_pk", "likely_fk")]
+                st.dataframe(df[show_cols], use_container_width=True)
+                pks = [c["name"] for c in cols_data if c.get("likely_pk")]
+                fks = [c["name"] for c in cols_data if c.get("likely_fk")]
+                if pks: st.caption(f"🔑 Likely PK(s): {', '.join(pks)}")
+                if fks: st.caption(f"🔗 Likely FK(s): {', '.join(fks)}")
+            st.markdown("---")
 
     elif agent_id == "sample_gen":
-        for s in data.get("samples",[]):
-            st.markdown(f"**{s.get('table_name')}** — {s.get('row_count')} rows")
-            st.dataframe(s.get("rows",[]), use_container_width=True)
+        for s in data.get("samples", []):
+            st.markdown(f"**{s.get('table_name')}** — {s.get('row_count')} synthetic rows")
+            if note := s.get("generation_notes"):
+                st.caption(note)
+            rows = s.get("rows", [])
+            if rows:
+                import pandas as pd
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            else:
+                st.info("No rows generated.")
 
     elif agent_id == "ingestion_cfg_gen":
-        for cfg_item in data.get("ingestion_configs",[]):
-            with st.expander(f"`{cfg_item.get('source_table')}` → `{cfg_item.get('target_table')}`"):
-                st.json(cfg_item)
+        for cfg in data.get("ingestion_configs", []):
+            with st.expander(
+                f"🔧 `{cfg.get('source_table')}` → `{cfg.get('target_table')}` "
+                f"[{cfg.get('load_type', '?')} · {cfg.get('source_format', '?')}]",
+                expanded=True,
+            ):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Load type",    cfg.get("load_type", "?"))
+                col2.metric("Format",       cfg.get("source_format", "?"))
+                col3.metric("Columns",      cfg.get("column_count", 0))
+
+                st.markdown("**Source path:**")
+                st.code(cfg.get("source_path", ""), language="text")
+
+                st.markdown("**Autoloader options:**")
+                st.json(cfg.get("autoloader_options", {}))
+
+                if ddl := cfg.get("target_ddl"):
+                    st.markdown("**Target table DDL:**")
+                    st.code(ddl, language="sql")
+
+                if code := cfg.get("python_code"):
+                    st.markdown("**Python notebook / DLT snippet:**")
+                    st.code(code, language="python")
+
+                with st.expander("Full config JSON"):
+                    st.json(cfg)
     else:
         st.json(data)
 
@@ -235,8 +283,8 @@ def _init_state():
         "extractor":      MetadataExtractor(),
         "history":        [],
         "loaded_tables":  [],   # list of metadata dicts built up by the user
-        "last_agent_id":  None, # tracks agent switches — clears workspace on change
-        "last_result":    None, # most recent AgentResult — shown after run
+        "last_agent_id":  None, # tracks agent switches - clears workspace on change
+        "last_result":    None, # most recent AgentResult - shown after run
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -247,20 +295,20 @@ orch:      Orchestrator       = st.session_state.orchestrator
 extractor: MetadataExtractor  = st.session_state.extractor
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # AGENT FORM DEFINITIONS
-# what_is_input   — plain-English explanation shown in the info box
-# needs_multi     — True if the agent should see ALL loaded tables
-# extra_fields    — list of additional controls beyond the table workspace
-# min_tables      — minimum tables required before Run is enabled
-# ═════════════════════════════════════════════════════════════════════════════
+# what_is_input   - plain-English explanation shown in the info box
+# needs_multi     - True if the agent should see ALL loaded tables
+# extra_fields    - list of additional controls beyond the table workspace
+# min_tables      - minimum tables required before Run is enabled
+# =============================================================================
 AGENT_FORMS = {
     "data_model_gen": {
         "what_is_input": (
             "Load **all source tables** that belong to the same subject area "
             "(e.g. customer, orders, order_items, products). "
             "The agent reads the relationships between them to correctly decide "
-            "which tables share a Hub, which form a Link, and which become Satellites — "
+            "which tables share a Hub, which form a Link, and which become Satellites - "
             "preventing hub explosion and correctly modelling many-to-many relationships."
         ),
         "needs_multi": True,
@@ -292,7 +340,7 @@ AGENT_FORMS = {
     },
     "test_query_gen": {
         "what_is_input": (
-            "Load the **target table(s)**. The agent writes executable Databricks SQL — "
+            "Load the **target table(s)**. The agent writes executable Databricks SQL - "
             "each query returns 0 (pass) or a positive count (failures found). "
             "Multiple tables generate cross-table FK queries automatically."
         ),
@@ -314,8 +362,8 @@ AGENT_FORMS = {
         "min_tables": 1,
         "extra_fields": [
             {"type": "multiselect", "key": "rule_priorities", "label": "Include priorities",
-             "options": ["P1 — Critical","P2 — High","P3 — Medium","P4 — Low"],
-             "default": ["P1 — Critical","P2 — High","P3 — Medium"]},
+             "options": ["P1 - Critical","P2 - High","P3 - Medium","P4 - Low"],
+             "default": ["P1 - Critical","P2 - High","P3 - Medium"]},
         ],
     },
     "dq_query_gen": {
@@ -337,7 +385,7 @@ AGENT_FORMS = {
     },
     "lineage_creator": {
         "what_is_input": (
-            "Load **all tables in the pipeline** — source, intermediate, and target. "
+            "Load **all tables in the pipeline** - source, intermediate, and target. "
             "The agent maps the full upstream → downstream data flow. "
             "The more tables you load, the more complete the lineage graph."
         ),
@@ -369,46 +417,62 @@ AGENT_FORMS = {
     },
     "data_profiler": {
         "what_is_input": (
-            "Load one or more tables from your catalog or a file path. "
-            "The profiler computes row counts, null rates, distinct counts, "
-            "and sample values for every column. No LLM used — free to run."
+            "Load one or more tables. With a SQL Warehouse ID: computes real null rates, "
+            "distinct counts, min/max/avg, and sample values. "
+            "Without warehouse: schema-only metadata. No LLM."
         ),
-        "needs_multi": True,
         "min_tables": 1,
-        "extra_fields": [],
+        "extra_fields": [
+            {"type": "text_input", "key": "warehouse_id_ctx",
+             "label": "SQL Warehouse ID (enables live column stats)",
+             "placeholder": "e.g. 3f2a1b4c5d6e7f8a",
+             "help": "Find in SQL Warehouses > warehouse > Connection details."},
+        ],
     },
     "sample_gen": {
         "what_is_input": (
-            "Load one or more tables. The generator produces synthetic rows "
-            "matching the schema — realistic values, no real PII."
+            "Load tables. Tier 1: real rows via SQL Warehouse. "
+            "Tier 2: smart synthetic from column name patterns "
+            "(email, country_code, status, amount, rating etc.). "
+            "Tier 3: type fallback. Add business rules to constrain output. No LLM."
         ),
-        "needs_multi": True,
         "min_tables": 1,
         "extra_fields": [
             {"type": "number_input", "key": "num_rows", "label": "Rows per table",
              "min_value": 1, "max_value": 50, "default": 5},
+            {"type": "text_area", "key": "business_rules",
+             "label": "Business rules (optional)",
+             "placeholder": "business rules: status must be one of: confirmed, pending, cancelled",
+             "height": 100,
+             "help": "Plain-English constraints applied to generated rows."},
+            {"type": "text_input", "key": "warehouse_id_ctx",
+             "label": "SQL Warehouse ID (for real rows)",
+             "placeholder": "e.g. 3f2a1b4c5d6e7f8a",
+             "help": "If set and table has data, real rows are fetched."},
         ],
     },
     "ingestion_cfg_gen": {
         "what_is_input": (
-            "Load your source table(s) or point at a file path. "
-            "The generator produces Databricks Autoloader configurations "
-            "ready to paste into a DLT pipeline. No LLM used — free to run."
+            "Load source table(s). Generates: Autoloader config, "
+            "notebook code (incremental MERGE/full/streaming), "
+            "DLT pipeline skeleton, and target Delta DDL. No LLM."
         ),
-        "needs_multi": True,
         "min_tables": 1,
         "extra_fields": [
             {"type": "selectbox", "key": "load_type", "label": "Load type",
-             "options": ["incremental","full","streaming"]},
-            {"type": "selectbox", "key": "source_format", "label": "Source file format",
-             "options": ["parquet","delta","csv","json","avro"]},
-            {"type": "text_input", "key": "source_path", "label": "Source path (optional)",
+             "options": ["incremental", "full", "streaming"]},
+            {"type": "selectbox", "key": "source_format", "label": "Source format",
+             "options": ["parquet", "delta", "csv", "json", "avro"]},
+            {"type": "text_input", "key": "source_path", "label": "Cloud source path",
              "placeholder": "e.g. abfss://raw@storage.dfs.core.windows.net/crm/"},
+            {"type": "text_input", "key": "target_catalog", "label": "Target catalog",
+             "placeholder": "e.g. bronze (default: bronze)"},
         ],
     },
+
 }
 
-# ── sample defaults shown in JSON editor ──────────────────────────────────────
+# -- sample defaults shown in JSON editor --------------------------------------
 SAMPLE_TABLE = {
     "table_name": "customer", "database": "crm_prod", "row_count": 1200000,
     "columns": [
@@ -424,9 +488,9 @@ SAMPLE_TABLE = {
 }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — agent selector + session stats
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# SIDEBAR - agent selector + session stats
+# =============================================================================
 
 with st.sidebar:
     st.markdown("## 🤖 Agent Catalog")
@@ -460,9 +524,9 @@ with st.sidebar:
         st.rerun()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN PANEL — header
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# MAIN PANEL - header
+# =============================================================================
 
 st.title("🏗️ Data Engineering Agent Platform")
 st.caption(f"Model: `{orch.cfg.llm_config.get('model')}` · Env: `{orch.cfg.environment}`")
@@ -474,7 +538,7 @@ with col2:
     st.subheader(chosen_meta["display_name"])
     st.caption(chosen_meta["description"])
     bc  = "#1a6fad" if chosen_meta["type"]=="agentic" else "#2a7a3b"
-    bl  = "LLM — uses tokens" if chosen_meta["type"]=="agentic" else "No LLM — free to run"
+    bl  = "LLM - uses tokens" if chosen_meta["type"]=="agentic" else "No LLM - free to run"
     tgs = " ".join(f"`{t}`" for t in chosen_meta.get("tags",[]))
     st.markdown(
         f"<span style='background:{bc};color:white;padding:2px 10px;border-radius:12px;font-size:0.75rem'>{bl}</span>&nbsp;&nbsp;{tgs}",
@@ -483,7 +547,7 @@ with col2:
 
 st.markdown("---")
 
-# ── Auto-clear workspace and last result when agent changes ──────────────────
+# -- Auto-clear workspace and last result when agent changes ------------------
 if st.session_state.last_agent_id != chosen_id:
     st.session_state.loaded_tables = []
     st.session_state.last_result   = None
@@ -493,11 +557,11 @@ form_def = AGENT_FORMS.get(chosen_id, {})
 if msg := form_def.get("what_is_input"):
     st.info(f"**What to provide:** {msg}", icon="ℹ️")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 1 — TABLE WORKSPACE  (add tables from any source)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# STEP 1 - TABLE WORKSPACE  (add tables from any source)
+# =============================================================================
 
-st.markdown("### Step 1 — Load tables")
+st.markdown("### Step 1 - Load tables")
 
 tab_catalog, tab_file, tab_json = st.tabs([
     "🗄️  From catalog / metastore",
@@ -505,7 +569,7 @@ tab_catalog, tab_file, tab_json = st.tabs([
     "✏️  Paste JSON manually",
 ])
 
-# ── Tab A: Catalog ────────────────────────────────────────────────────────────
+# -- Tab A: Catalog ------------------------------------------------------------
 with tab_catalog:
     st.caption(
         "Browse your Unity Catalog or Hive metastore directly. "
@@ -513,7 +577,7 @@ with tab_catalog:
         "if a SQL warehouse ID is configured (optional)."
     )
 
-    # Step 1 — pick catalog
+    # Step 1 - pick catalog
     with st.spinner("Loading catalogs…"):
         try:
             available_catalogs = extractor.list_catalogs()
@@ -547,12 +611,12 @@ with tab_catalog:
                 available_schemas = []
             sel_schema = st.selectbox(
                 "Schema",
-                available_schemas if available_schemas else ["— select a catalog first —"],
+                available_schemas if available_schemas else ["- select a catalog first -"],
                 disabled=not available_schemas,
             )
 
-        # Step 2 — pick tables
-        if sel_catalog and sel_schema and sel_schema != "— select a catalog first —":
+        # Step 2 - pick tables
+        if sel_catalog and sel_schema and sel_schema != "- select a catalog first -":
             with st.spinner(f"Loading tables in {sel_catalog}.{sel_schema}…"):
                 available_tables = extractor.list_tables(sel_catalog, sel_schema)
         else:
@@ -576,7 +640,7 @@ with tab_catalog:
             help="Prepended to table name for the DV2 RECORD_SOURCE column.",
         )
         wh_id_input = st.text_input(
-            "SQL Warehouse ID (optional — for column stats)",
+            "SQL Warehouse ID (optional - for column stats)",
             value=os.getenv("DATABRICKS_WAREHOUSE_ID", ""),
             help=(
                 "If provided, the platform runs COUNT, COUNT(DISTINCT) and sample "
@@ -588,7 +652,7 @@ with tab_catalog:
     load_catalog_btn = st.button(
         "Load selected tables" if sel_tables else "Load ALL tables in schema",
         use_container_width=True,
-        disabled=(not sel_catalog or not sel_schema or sel_schema == "— select a catalog first —"),
+        disabled=(not sel_catalog or not sel_schema or sel_schema == "- select a catalog first -"),
     )
 
     if load_catalog_btn:
@@ -617,7 +681,7 @@ with tab_catalog:
             except Exception as e:
                 st.error(str(e))
 
-# ── Tab B: File path ──────────────────────────────────────────────────────────
+# -- Tab B: File path ----------------------------------------------------------
 with tab_file:
     if not _spark_available():
         st.warning(
@@ -692,7 +756,7 @@ print(json.dumps(tables, indent=2))""",
                     except (RuntimeError, ValueError) as e:
                         st.error(str(e))
 
-# ── Tab C: Manual JSON ────────────────────────────────────────────────────────
+# -- Tab C: Manual JSON --------------------------------------------------------
 with tab_json:
     st.caption(
         "Paste metadata as JSON. Useful for tables from external systems or quick prototyping. "
@@ -723,7 +787,7 @@ with tab_json:
         except ValueError as e:
             st.error(f"Validation error: {e}")
 
-# ── Table workspace summary ───────────────────────────────────────────────────
+# -- Table workspace summary ---------------------------------------------------
 st.markdown("#### Table workspace")
 
 if not st.session_state.loaded_tables:
@@ -762,12 +826,12 @@ else:
             st.dataframe(all_rels, use_container_width=True)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 2 — AGENT OPTIONS + RUN
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# STEP 2 - AGENT OPTIONS + RUN
+# =============================================================================
 
 st.markdown("---")
-st.markdown("### Step 2 — Configure and run")
+st.markdown("### Step 2 - Configure and run")
 
 min_tables   = form_def.get("min_tables", 1)
 ready_to_run = len(st.session_state.loaded_tables) >= min_tables
@@ -832,13 +896,13 @@ with st.form(key=f"run_form_{chosen_id}"):
         )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # EXECUTION
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 if submitted and ready_to_run:
 
-    # Build metadata list — always pass all loaded tables
+    # Build metadata list - always pass all loaded tables
     metadata = st.session_state.loaded_tables
 
     # Merge extra field values into dq_query_gen if existing rules provided
@@ -864,7 +928,7 @@ if submitted and ready_to_run:
         context_parts.append(user_context.strip())
     full_context = "\n".join(context_parts)
 
-    # ── Run with st.status — shows animated progress, then full log ──────
+    # -- Run with st.status - shows animated progress, then full log ------
     n_tables   = len(metadata)
     total_cols = sum(len(t.get("columns", [])) for t in metadata)
 
@@ -872,12 +936,12 @@ if submitted and ready_to_run:
     # orch.run() executes, then collapses to "Complete" with the log inside.
     with st.status(
         f"Running {chosen_meta['display_name']} on {n_tables} table(s) "
-        f"({total_cols} columns) — please wait…",
+        f"({total_cols} columns) - please wait…",
         expanded=True,
     ) as status_box:
         st.write(
             f"⏳ Calling **{orch.cfg.llm_config.get('model')}**. "
-            f"Large schemas can take 30–120 seconds."
+            f"Large schemas can take 30-120 seconds."
         )
 
         result = orch.run(
@@ -947,7 +1011,7 @@ if submitted and ready_to_run:
                 else:
                     st.info("No flat tabular representation available for this output.")
             else:
-                st.info("Output is not structured JSON — no table view available.")
+                st.info("Output is not structured JSON - no table view available.")
         with t3:
             if parsed_json: st.json(parsed_json)
             else: st.code(str(output))
@@ -975,9 +1039,9 @@ if submitted and ready_to_run:
         with st.expander("Full error"): st.code(result.error)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # HISTORY
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 if st.session_state.history:
     st.markdown("---")
@@ -991,10 +1055,10 @@ if st.session_state.history:
             )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # OUTPUT RENDERERS
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TABULAR FLATTENER — converts agent JSON output to a pandas DataFrame for CSV
+# =============================================================================
+# TABULAR FLATTENER - converts agent JSON output to a pandas DataFrame for CSV
